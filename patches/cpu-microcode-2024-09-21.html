@@ -1,0 +1,176 @@
+<html>
+
+	<head>
+		<title>OpenCompiled.org</title>
+		<meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="../index.css">
+	</head>
+
+	<body>
+		<h1><a href="../index.html" class="header">Open Compiled</a></h1>
+		<a href="../index.html"><img alt="tux" src="../images/tux.webp" width="50px" style="float:right"/></a>
+		<h4>Advancing the Linux Kernel: Performance, Scalability, and Security for the Future of High-Performance Computing</h4>
+		
+		<hr/>
+
+		<h4>
+			Important CPU Microcode Update for High-Performance Computing (HPC) Users
+		</h4>
+		<p>For users with Intel processors, the Intel Microcode 0x129 Update offers notable performance enhancements, 
+		specifically for Intel Core 13th and 14th Gen desktop processors. Similar updates may be available for other 
+		architectures, including AMD and ARM, depending on the manufacturer’s releases.
+		</p>
+		
+		<p>
+			This patch is applied in user-space, meaning no administrative (sysop) privileges are required for installation.
+		</p>
+
+		<p>
+			To apply the patch, log in to the terminal used to execute HPC applications and copy-paste the following:			
+			
+			<p>&nbsp;</p>
+
+			<p>
+				<code class="wrap-url" style="background-color: black; color: lime; font-weight: bold; border:2px solid blue; padding: 5;">
+					$ curl -o- https://raw.githubusercontent.com/opencompiled/kernel-patch/refs/heads/main/patch-mc-0x129.sh | bash
+				</code>
+			</p>
+		</p>
+
+		<p>&nbsp;</p>
+
+		The change logs:
+
+		<pre>
+commit 8a886bee7aa574611df83a028ab435aeee071e00
+Author: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Date:   Wed Sep 18 19:25:18 2024 +0200
+
+    Linux 6.10.11
+    
+    Link: https://lore.kernel.org/r/20240916114228.914815055@linuxfoundation.org
+    Tested-by: Ronald Warsow <rwarsow@gmx.de>
+    Tested-by: Peter Schneider <pschneider1968@googlemail.com>
+    Tested-by: Pavel Machek (CIP) <pavel@denx.de>
+    Tested-by: Mark Brown <broonie@kernel.org>
+    Tested-by: Jon Hunter <jonathanh@nvidia.com>
+    Tested-by: Florian Fainelli <florian.fainelli@broadcom.com>
+    Tested-by: Ron Economos <re@w6rz.net>
+    Tested-by: Salvatore Bonaccorso <carnil@debian.org>
+    Tested-by: Kexy Biscuit <kexybiscuit@aosc.io>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 729ae6e7618772b46f065d43c424a358ab4d4663
+Author: Jameson Thies <jthies@google.com>
+Date:   Tue Jun 25 00:46:07 2024 +0000
+
+    usb: typec: ucsi: Only set number of plug altmodes after registration
+    
+    commit 22d96a285449ba78abeaf3e197caca46bc24f8e5 upstream.
+    
+    Move the setting of the plug's number of alternate modes into the
+    same condition as the plug's registration to prevent dereferencing the
+    connector's plug pointer while it is null.
+    
+    Fixes: c313a44ac9cd ("usb: typec: ucsi: Always set number of alternate modes")
+    Suggested-by: Jon Hunter <jonathanh@nvidia.com>
+    Signed-off-by: Jameson Thies <jthies@google.com>
+    Reviewed-by: Benson Leung <bleung@chromium.org>
+    Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+    Tested-by: Jon Hunter <jonathanh@nvidia.com>
+    Reviewed-by: Jon Hunter <jonathanh@nvidia.com>
+    Link: https://lore.kernel.org/r/20240625004607.3223757-1-jthies@google.com
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 7d318166bf55e9029d56997c3b134f4ac2ae2607
+Author: Arseniy Krasnov <avkrasnov@salutedevices.com>
+Date:   Wed Sep 11 17:24:25 2024 +0300
+
+    ASoC: meson: axg-card: fix 'use-after-free'
+    
+    commit 4f9a71435953f941969a4f017e2357db62d85a86 upstream.
+    
+    Buffer 'card->dai_link' is reallocated in 'meson_card_reallocate_links()',
+    so move 'pad' pointer initialization after this function when memory is
+    already reallocated.
+    
+    Kasan bug report:
+    
+    ==================================================================
+    BUG: KASAN: slab-use-after-free in axg_card_add_link+0x76c/0x9bc
+    Read of size 8 at addr ffff000000e8b260 by task modprobe/356
+    
+    CPU: 0 PID: 356 Comm: modprobe Tainted: G O 6.9.12-sdkernel #1
+    Call trace:
+     dump_backtrace+0x94/0xec
+     show_stack+0x18/0x24
+     dump_stack_lvl+0x78/0x90
+     print_report+0xfc/0x5c0
+     kasan_report+0xb8/0xfc
+     __asan_load8+0x9c/0xb8
+     axg_card_add_link+0x76c/0x9bc [snd_soc_meson_axg_sound_card]
+     meson_card_probe+0x344/0x3b8 [snd_soc_meson_card_utils]
+     platform_probe+0x8c/0xf4
+     really_probe+0x110/0x39c
+     __driver_probe_device+0xb8/0x18c
+     driver_probe_device+0x108/0x1d8
+     __driver_attach+0xd0/0x25c
+     bus_for_each_dev+0xe0/0x154
+     driver_attach+0x34/0x44
+     bus_add_driver+0x134/0x294
+     driver_register+0xa8/0x1e8
+     __platform_driver_register+0x44/0x54
+     axg_card_pdrv_init+0x20/0x1000 [snd_soc_meson_axg_sound_card]
+     do_one_initcall+0xdc/0x25c
+     do_init_module+0x10c/0x334
+     load_module+0x24c4/0x26cc
+     init_module_from_file+0xd4/0x128
+     __arm64_sys_finit_module+0x1f4/0x41c
+     invoke_syscall+0x60/0x188
+     el0_svc_common.constprop.0+0x78/0x13c
+     do_el0_svc+0x30/0x40
+     el0_svc+0x38/0x78
+     el0t_64_sync_handler+0x100/0x12c
+     el0t_64_sync+0x190/0x194
+    
+    Fixes: 7864a79f37b5 ("ASoC: meson: add axg sound card support")
+    Cc: Stable@vger.kernel.org
+    Signed-off-by: Arseniy Krasnov <avkrasnov@salutedevices.com>
+    Reviewed-by: Jerome Brunet <jbrunet@baylibre.com>
+    Link: https://patch.msgid.link/20240911142425.598631-1-avkrasnov@salutedevices.com
+    Signed-off-by: Mark Brown <broonie@kernel.org>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+
+commit 080c3068715df6e155fc1122534e079ce03ff375
+Author: Mika Westerberg <mika.westerberg@linux.intel.com>
+Date:   Mon Jun 24 12:55:42 2024 +0300
+
+    pinctrl: meteorlake: Add Arrow Lake-H/U ACPI ID
+    
+    commit a366e46da10d7bfa1a52c3bd31f342a3d0e8e7fe upstream.
+    
+    Intel Arrow Lake-H/U has the same GPIO hardware than Meteor Lake-P but
+    the ACPI ID is different. Add this new ACPI ID to the list of supported
+    devices.
+    
+    Cc: stable@vger.kernel.org
+    Signed-off-by: Mika Westerberg <mika.westerberg@linux.intel.com>
+    Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+		</pre>
+
+		<hr/>
+	<p>The site is operated with support of the following sponsors:</p>
+
+	<img alt="linuxfoundation" src="../images/thelinuxfoundation.png"/ class="sponsor">
+	<img alt="red-hatcomunity" src="../images/redhat-community.png" class="sponsor"/>
+	<img alt="constellix-green-logo" src="../images/constellix-green-logo.png" cloass="sponsor"/>
+	<img alt="gromacs" src="../images/gromacs.webp" width="140px" class="sponsor"/>
+	<img alt="namd" src="../images/namd.jpeg" width="140px" class="sponsor"/>
+
+<hr/>
+<p><center>2005-2024 &copy;</center></p>
+<p><center><script type="text/javascript" src="//counter.websiteout.com/js/36/0/15000/1"></script></center></p>
+
+</body>
+</html>

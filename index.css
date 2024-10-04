@@ -1,0 +1,22 @@
+html {
+	background-color: white; /* Outer background color */
+}
+body {
+	margin: auto;
+	padding: 2%;
+	width: 50%;
+	background-color: lightgrey;
+	border-left: 1px solid black;
+	border-right: 1px solid black;
+}
+.sponsor {
+	padding: 2px;
+}
+.header {
+	text-decoration: none;
+  color: inherit;
+}
+.wrap-url {
+	white-space: normal;
+	word-break: break-all;
+}
